@@ -50,6 +50,11 @@ MAX_COMPRESSION_RATIO = _int_env(
 # 每个作业在结果 JSON 中保留的问题条数上限
 MAX_ISSUES_REPORTED = _int_env("MAILRECON_MAX_ISSUES_REPORTED", 200)
 
+# 单个案件允许合并的源作业数量上限
+MAX_CASE_JOBS = _int_env("MAILRECON_MAX_CASE_JOBS", 100)
+# 单个案件允许合并的邮件总量上限（各源作业 email_count 之和）
+MAX_CASE_EMAILS = _int_env("MAILRECON_MAX_CASE_EMAILS", 100_000)
+
 # 作业状态
 STATUS_QUEUED = "queued"
 STATUS_PROCESSING = "processing"

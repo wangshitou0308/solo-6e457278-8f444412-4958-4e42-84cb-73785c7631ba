@@ -1,4 +1,4 @@
-"""SQLite 元数据持久化与作业落盘文件管理。
+"""SQLite 元数据持久化与作业/案件落盘文件管理。
 
 作业目录布局::
 
@@ -6,6 +6,11 @@
         upload.bin     # 收到的原始 ZIP（字节不动，便于审计/重放）
         result.json    # 处理完成后的会话结果
         extract/       # 处理期间的受控解压目录，处理后立即删除
+
+案件目录布局（与作业目录完全独立，删除源作业不影响案件结果）::
+
+    DATA_DIR/cases/<case_id>/
+        result.json    # 跨包合并完成后的会话森林
 """
 
 from __future__ import annotations
@@ -39,6 +44,21 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency
     ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE TABLE IF NOT EXISTS cases (
+    id                TEXT PRIMARY KEY,
+    status            TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    name              TEXT,
+    progress          INTEGER NOT NULL DEFAULT 0,
+    phase             TEXT,
+    error             TEXT,
+    job_ids_json      TEXT NOT NULL,
+    email_count       INTEGER NOT NULL DEFAULT 0,
+    thread_count      INTEGER NOT NULL DEFAULT 0,
+    stats_json        TEXT,
+    result_path       TEXT
+);
 """
 
 
@@ -214,6 +234,123 @@ class Storage:
             ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
+    # ---------------------------------------------------------- 案件目录
+
+    @staticmethod
+    def case_dir(case_id: str) -> Path:
+        return config.DATA_DIR / "cases" / case_id
+
+    @classmethod
+    def prepare_case_dir(cls, case_id: str) -> Path:
+        path = cls.case_dir(case_id)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    # ---------------------------------------------------------- 案件 CRUD
+
+    def create_case(
+        self,
+        case_id: str,
+        name: str | None,
+        job_ids: list[str],
+    ) -> None:
+        now = utc_now()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO cases (id, status, created_at, updated_at,
+                                   name, job_ids_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    case_id,
+                    config.STATUS_QUEUED,
+                    now,
+                    now,
+                    name,
+                    json.dumps(job_ids),
+                ),
+            )
+
+    def get_case(self, case_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM cases WHERE id = ?", (case_id,)
+            ).fetchone()
+        return _case_row_to_dict(row) if row else None
+
+    def update_case_progress(
+        self,
+        case_id: str,
+        status: str | None = None,
+        progress: int | None = None,
+        phase: str | None = None,
+    ) -> None:
+        sets = ["updated_at = ?"]
+        params: list[Any] = [utc_now()]
+        if status is not None:
+            sets.append("status = ?")
+            params.append(status)
+        if progress is not None:
+            sets.append("progress = ?")
+            params.append(progress)
+        if phase is not None:
+            sets.append("phase = ?")
+            params.append(phase)
+        params.append(case_id)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE cases SET {', '.join(sets)} WHERE id = ?", params
+            )
+
+    def complete_case(
+        self,
+        case_id: str,
+        result_path: str,
+        email_count: int,
+        thread_count: int,
+        stats: dict[str, Any],
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE cases SET status = ?, updated_at = ?, progress = 100,
+                                 phase = ?, error = NULL, email_count = ?,
+                                 thread_count = ?, stats_json = ?,
+                                 result_path = ?
+                WHERE id = ?
+                """,
+                (
+                    config.STATUS_COMPLETED,
+                    utc_now(),
+                    "completed",
+                    email_count,
+                    thread_count,
+                    json.dumps(stats, ensure_ascii=False),
+                    result_path,
+                    case_id,
+                ),
+            )
+
+    def fail_case(self, case_id: str, error: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE cases SET status = ?, updated_at = ?, phase = ?,
+                                 error = ? WHERE id = ?
+                """,
+                (config.STATUS_FAILED, utc_now(), "failed", error, case_id),
+            )
+
+    def unfinished_cases(self) -> list[dict[str, Any]]:
+        """服务重启后找出卡在 processing/queued 的案件。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM cases WHERE status IN (?, ?)",
+                (config.STATUS_PROCESSING, config.STATUS_QUEUED),
+            ).fetchall()
+        return [_case_row_to_dict(row) for row in rows]
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -221,12 +358,24 @@ class Storage:
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
-    if data.get("stats_json"):
-        try:
-            data["stats"] = json.loads(data["stats_json"])
-        except json.JSONDecodeError:
-            data["stats"] = None
-    else:
-        data["stats"] = None
-    data.pop("stats_json", None)
+    data["stats"] = _parse_stats(data.pop("stats_json", None))
     return data
+
+
+def _case_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    data["stats"] = _parse_stats(data.pop("stats_json", None))
+    try:
+        data["job_ids"] = json.loads(data.pop("job_ids_json"))
+    except (json.JSONDecodeError, TypeError):
+        data["job_ids"] = []
+    return data
+
+
+def _parse_stats(raw: str | None) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None

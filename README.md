@@ -3,6 +3,8 @@
 供法务与支持团队整理历史邮件包的**纯本地、零外部依赖**服务：接收含 `.eml`
 文件的 ZIP，安全校验后解析 MIME，按 `Message-ID` / `In-Reply-To` /
 `References` 引用链重建会话树，并通过 HTTP 接口查询与下载 JSON 结果。
+案件级多包合并可把多个已完成作业拼成一棵跨包会话森林：重复邮件按
+SHA-256 归并、Message-ID 冲突并列保留、跨包补齐缺失父邮件。
 
 * 仅使用 Python 标准库：`http.server`、`email`、`zipfile`、`sqlite3`；
 * 不修改、不回传任何原始邮件，附件只导出元数据（名称/类型/大小/SHA-256）；
@@ -17,16 +19,19 @@ mailrecon/            服务源码
   zipguard.py         ZIP 安全校验与受控解压
   mailparser.py       单封 .eml 解析（MIME/字符集/正文/附件/引用头）
   threads.py          会话树重建（缺失/成环/重复 ID 处理，迭代式）
+  casemerge.py        案件级多包合并（去重/冲突/补链，迭代式）
   jsonio.py           迭代式 JSON 解析/序列化（深引用链不受递归深度限制）
-  storage.py          SQLite 元数据 + 作业落盘文件管理
+  storage.py          SQLite 元数据 + 作业/案件落盘文件管理
   processor.py        后台作业流水线（单线程顺序处理）
+  caseproc.py         后台案件合并流水线（单线程顺序处理）
   server.py           HTTP API（http.server）
   __main__.py         启动入口
 scripts/
   make_sample.py      生成正常示例包 examples/sample-mails.zip
+  make_case_sample.py 生成案件合并示例包 examples/case-pack-{1,2}.zip
   make_evil.py        生成应被拒绝的恶意/超限 ZIP
-tests/                65 个 unittest 用例
-examples/             生成产物（正常包 + evil/ 恶意包）
+tests/                92 个 unittest 用例
+examples/             生成产物（正常包 + 案件示例包 + evil/ 恶意包）
 docs/API.md           接口文档
 docs/API_EXAMPLES.sh  curl 调用示例
 ```
@@ -58,6 +63,8 @@ curl -X POST http://127.0.0.1:8080/api/v1/jobs \
 | `MAILRECON_MAX_TOTAL_UNCOMPRESSED` | `1073741824` (1 GiB) | 解压总体积上限 |
 | `MAILRECON_MAX_ENTRY_SIZE` | `104857600` (100 MiB) | 单条目解压体积上限 |
 | `MAILRECON_MAX_COMPRESSION_RATIO` | `200` | 压缩比上限（ZIP 炸弹特征） |
+| `MAILRECON_MAX_CASE_JOBS` | `100` | 单个案件可合并的作业数上限 |
+| `MAILRECON_MAX_CASE_EMAILS` | `100000` | 单个案件邮件总量上限 |
 
 ## 安全策略摘要
 
@@ -91,22 +98,49 @@ Python 递归，因此即使整个包是一条上万封邮件的回复链（远�
   （UTF-8 → GB18030 → Latin-1）并记录问题；
 * 其余解析缺陷（畸形日期/头、附件解码失败等）计入 `other`。
 
+## 案件级多包合并
+
+`POST /api/v1/cases` 把多个**已完成**作业合并为一个案件，后台重建跨包
+会话森林（接口详见 `docs/API.md` 第 8–11 节）：
+
+* **去重**：SHA-256 相同的邮件合并为一个节点，`sources` 保留全部来源
+  作业与文件名；
+* **冲突**：Message-ID 相同但内容不同的邮件并列保留并标注
+  （`merge_info.conflict`），引用该 ID 时**不猜测父节点**，可沿
+  References 上溯无歧义祖先；
+* **补链**：父邮件在某作业包内缺失、但在案件其他作业中找到时跨包挂载，
+  依据记入 `merge_info.relinked_parent`；
+* **贡献汇总**：`stats.job_contributions` 按作业统计唯一节点、被合并
+  重复、冲突参与、补链与根节点数；
+* 源作业未完成 / 已删除 / 在同一案件中重复提交时，创建即被拒绝并说明
+  原因；案件结果独立落盘，完成后删除源作业不影响读取，服务重启自动
+  恢复未完成的案件。
+
+```bash
+python3 scripts/make_case_sample.py   # 生成两个有关联的示例包
+# 分别上传为作业后：
+curl -X POST http://127.0.0.1:8080/api/v1/cases \
+     -H 'Content-Type: application/json' \
+     -d '{"name": "合同谈判合并", "job_ids": ["<job1>", "<job2>"]}'
+```
+
 ## 作业落盘与删除
 
 ```
-DATA_DIR/mailrecon.db              SQLite 元数据
-DATA_DIR/jobs/<job_id>/upload.bin  收到的原始 ZIP（字节不动）
-DATA_DIR/jobs/<job_id>/result.json 结果 JSON
-DATA_DIR/jobs/<job_id>/extract/    处理期间临时解压目录，完成后立即删除
+DATA_DIR/mailrecon.db               SQLite 元数据（作业 + 案件）
+DATA_DIR/jobs/<job_id>/upload.bin   收到的原始 ZIP（字节不动）
+DATA_DIR/jobs/<job_id>/result.json  结果 JSON
+DATA_DIR/jobs/<job_id>/extract/     处理期间临时解压目录，完成后立即删除
+DATA_DIR/cases/<case_id>/result.json 案件合并结果（与源作业目录独立）
 ```
 
 `DELETE /api/v1/jobs/{id}` 会删除元数据并 `rmtree` 整个作业目录；
-服务重启后，上次未完成的作业会自动重新入队处理。
+服务重启后，上次未完成的作业与案件会自动重新入队处理。
 
 ## 测试
 
 ```bash
-python3 -m unittest discover -s tests -v     # 65 个用例
+python3 -m unittest discover -s tests -v     # 92 个用例
 ```
 
 ## 更多

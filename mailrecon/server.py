@@ -12,10 +12,11 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from . import config, jsonio
+from .caseproc import CaseProcessor
 from .processor import JobProcessor
 from .storage import Storage
 
-_JOB_ID_RE = re.compile(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")
+_UUID_RE = re.compile(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")
 _IDEMPOTENCY_RE = re.compile(r"^[\x21-\x7E]{8,200}$")
 
 # 超过该嵌套深度的响应放弃缩进，改用紧凑 JSON（避免 O(深度²) 输出）
@@ -107,6 +108,7 @@ class Handler(BaseHTTPRequestHandler):
     # 方便类型提示；实际在 ApiServer 上注入
     storage: Storage
     processor: JobProcessor
+    case_processor: CaseProcessor
     create_lock: threading.Lock
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -193,6 +195,18 @@ class Handler(BaseHTTPRequestHandler):
                 if match:
                     self._get_result(match.group(1))
                     return
+                match = re.fullmatch(r"/api/v1/cases/([^/]+)", path)
+                if match:
+                    self._get_case(match.group(1))
+                    return
+                match = re.fullmatch(r"/api/v1/cases/([^/]+)/tree", path)
+                if match:
+                    self._get_case_tree(match.group(1), query)
+                    return
+                match = re.fullmatch(r"/api/v1/cases/([^/]+)/result", path)
+                if match:
+                    self._get_case_result(match.group(1))
+                    return
                 self._error(404, "not_found", f"未知路径: {self.path}")
         except ApiError as exc:
             self._error(exc.status, exc.code, exc.message)
@@ -205,6 +219,8 @@ class Handler(BaseHTTPRequestHandler):
             path = parsed.path.rstrip("/") or "/"
             if path == "/api/v1/jobs":
                 self._create_job()
+            elif path == "/api/v1/cases":
+                self._create_case()
             else:
                 self._error(404, "not_found", f"未知路径: {self.path}")
         except ApiError as exc:
@@ -245,7 +261,7 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def _require_job(self, job_id: str) -> dict[str, Any]:
-        if not _JOB_ID_RE.fullmatch(job_id):
+        if not _UUID_RE.fullmatch(job_id):
             raise ApiError(400, "bad_request", "作业 ID 格式非法")
         job = self.storage.get_job(job_id)
         if job is None:
@@ -383,12 +399,165 @@ class Handler(BaseHTTPRequestHandler):
         job = self.storage.get_job(job_id)
         self._json(201, self._public_job(job))
 
+    # ------------------------------------------------------ 案件端点
 
-def _compact_forest(roots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _public_case(self, case: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": case["id"],
+            "name": case["name"],
+            "status": case["status"],
+            "created_at": case["created_at"],
+            "updated_at": case["updated_at"],
+            "job_ids": case["job_ids"],
+            "progress": case["progress"],
+            "phase": case["phase"],
+            "error": case["error"],
+            "email_count": case["email_count"],
+            "thread_count": case["thread_count"],
+            "stats": case["stats"],
+        }
+
+    def _require_case(self, case_id: str) -> dict[str, Any]:
+        if not _UUID_RE.fullmatch(case_id):
+            raise ApiError(400, "bad_request", "案件 ID 格式非法")
+        case = self.storage.get_case(case_id)
+        if case is None:
+            raise ApiError(404, "not_found", f"案件不存在: {case_id}")
+        return case
+
+    def _create_case(self) -> None:
+        content_type = self.headers.get("Content-Type", "")
+        if content_type.lower().split(";")[0].strip() != "application/json":
+            raise ApiError(
+                415,
+                "unsupported_media_type",
+                "创建案件请使用 application/json 请求体",
+            )
+        body = self._read_body_capped()
+        if not body:
+            raise ApiError(400, "bad_request", "请求体为空")
+        try:
+            payload = jsonio.loads(body)
+        except Exception:
+            raise ApiError(400, "bad_request", "请求体不是合法 JSON")
+        if not isinstance(payload, dict):
+            raise ApiError(400, "bad_request", "请求体必须是 JSON 对象")
+
+        name = payload.get("name")
+        if name is not None:
+            if not isinstance(name, str):
+                raise ApiError(400, "bad_request", "name 必须是字符串")
+            name = name.strip()[:200] or None
+
+        job_ids = payload.get("job_ids")
+        if not isinstance(job_ids, list) or not job_ids:
+            raise ApiError(400, "bad_request", "job_ids 必须是非空数组")
+        if len(job_ids) > config.MAX_CASE_JOBS:
+            raise ApiError(
+                400,
+                "bad_request",
+                f"单个案件最多合并 {config.MAX_CASE_JOBS} 个作业，"
+                f"实际提交 {len(job_ids)} 个",
+            )
+        for job_id in job_ids:
+            if not isinstance(job_id, str) or not _UUID_RE.fullmatch(job_id):
+                raise ApiError(
+                    400, "bad_request", f"作业 ID 格式非法: {job_id!r}"
+                )
+        seen: set[str] = set()
+        duplicated: list[str] = []
+        for job_id in job_ids:
+            if job_id in seen and job_id not in duplicated:
+                duplicated.append(job_id)
+            seen.add(job_id)
+        if duplicated:
+            raise ApiError(
+                409,
+                "duplicate_job",
+                "同一作业在同一案件中重复提交: " + ", ".join(duplicated),
+            )
+
+        with self.create_lock:
+            total_emails = 0
+            for job_id in job_ids:
+                job = self.storage.get_job(job_id)
+                if job is None:
+                    raise ApiError(
+                        404,
+                        "job_not_found",
+                        f"源作业不存在或已被删除: {job_id}",
+                    )
+                if job["status"] != config.STATUS_COMPLETED:
+                    raise ApiError(
+                        409,
+                        "job_not_completed",
+                        f"源作业未完成，不能加入案件: {job_id} "
+                        f"(当前状态: {job['status']})",
+                    )
+                total_emails += job["email_count"]
+            if total_emails > config.MAX_CASE_EMAILS:
+                raise ApiError(
+                    409,
+                    "case_too_large",
+                    f"案件邮件总量 {total_emails} 超过上限 "
+                    f"{config.MAX_CASE_EMAILS}",
+                )
+            case_id = str(uuid.uuid4())
+            Storage.prepare_case_dir(case_id)
+            self.storage.create_case(case_id, name, job_ids)
+
+        self.case_processor.enqueue(case_id)
+        self._json(201, self._public_case(self.storage.get_case(case_id)))
+
+    def _get_case(self, case_id: str) -> None:
+        self._json(200, self._public_case(self._require_case(case_id)))
+
+    def _get_case_tree(
+        self, case_id: str, query: dict[str, list[str]]
+    ) -> None:
+        case = self._require_case(case_id)
+        if case["status"] != config.STATUS_COMPLETED or not case["result_path"]:
+            raise ApiError(
+                409,
+                "not_ready",
+                f"案件尚未完成 (当前状态: {case['status']})",
+            )
+        result = jsonio.loads(Path(case["result_path"]).read_text("utf-8"))
+        payload: dict[str, Any] = {
+            "case_id": case["id"],
+            "name": case["name"],
+            "source_jobs": result["source_jobs"],
+            "stats": result["stats"],
+            "threads": result["threads"],
+        }
+        if query.get("view") == ["compact"]:
+            payload["threads"] = _compact_forest(
+                result["threads"], _compact_case_node
+            )
+        self._json(200, payload)
+
+    def _get_case_result(self, case_id: str) -> None:
+        case = self._require_case(case_id)
+        if case["status"] != config.STATUS_COMPLETED or not case["result_path"]:
+            raise ApiError(
+                409,
+                "not_ready",
+                f"案件尚未完成 (当前状态: {case['status']})",
+            )
+        download_name = f"{case['id']}.case-result.json"
+        self._file_download(Path(case["result_path"]), download_name)
+
+
+def _compact_forest(
+    roots: list[dict[str, Any]],
+    compact_node: Any = None,
+) -> list[dict[str, Any]]:
     """迭代式生成紧凑树视图，不受递归深度限制，children 保持原顺序。"""
+    if compact_node is None:
+        compact_node = _compact_node
     compact_roots: list[dict[str, Any]] = []
     for source_root in roots:
-        target_root = _compact_node(source_root)
+        target_root = compact_node(source_root)
         compact_roots.append(target_root)
         # (源节点, 目标父节点)；逆序压栈以保持 children 顺序
         stack: list[tuple[dict[str, Any], dict[str, Any]]] = [
@@ -397,7 +566,7 @@ def _compact_forest(roots: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ]
         while stack:
             source, target_parent = stack.pop()
-            target = _compact_node(source)
+            target = compact_node(source)
             target_parent["children"].append(target)
             for child in reversed(source["children"]):
                 stack.append((child, target))
@@ -412,6 +581,24 @@ def _compact_node(node: dict[str, Any]) -> dict[str, Any]:
         "date": node["date"],
         "from": node["from"],
         "subject": node["subject"],
+        "issue_count": len(node["issues"]),
+        "attachment_count": len(node["attachments"]),
+        "children": [],
+    }
+
+
+def _compact_case_node(node: dict[str, Any]) -> dict[str, Any]:
+    """案件合并树的紧凑节点：保留来源与冲突/补链标记，省略正文等明细。"""
+    info = node["merge_info"]
+    return {
+        "uid": node["uid"],
+        "message_id": node["message_id"],
+        "date": node["date"],
+        "from": node["from"],
+        "subject": node["subject"],
+        "sources": node["sources"],
+        "conflict": info["conflict"],
+        "relinked": info["relinked_parent"] is not None,
         "issue_count": len(node["issues"]),
         "attachment_count": len(node["attachments"]),
         "children": [],
@@ -437,18 +624,22 @@ class ApiServer(ThreadingHTTPServer):
         super().__init__((host, port), Handler)
         self.storage = Storage()
         self.processor = JobProcessor(self.storage)
+        self.case_processor = CaseProcessor(self.storage)
         self.create_lock = threading.Lock()
         # 注入给 Handler 实例使用
         Handler.storage = self.storage
         Handler.processor = self.processor
+        Handler.case_processor = self.case_processor
         Handler.create_lock = self.create_lock
 
     def start(self) -> None:
         """启动后台处理线程（serve_forever 由调用方驱动）。"""
         self.processor.start()
+        self.case_processor.start()
 
     def serve(self) -> None:
         self.processor.start()
+        self.case_processor.start()
         try:
             self.serve_forever()
         finally:

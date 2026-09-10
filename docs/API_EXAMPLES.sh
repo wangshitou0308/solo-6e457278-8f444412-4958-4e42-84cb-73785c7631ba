@@ -66,3 +66,64 @@ curl -s -X DELETE "$BASE/api/v1/jobs/$JOB_ID"; echo
 # curl -s -X POST "$BASE/api/v1/jobs" \
 #   -F 'file=@examples/evil/evil-traversal.zip;type=application/zip'
 # 随后轮询可见 status=failed，error="压缩包被拒绝: 检测到非法/路径穿越条目: …"
+
+# ================================================================ 案件合并（多包）
+# 前置：python3 scripts/make_case_sample.py 生成 examples/case-pack-1.zip
+# 与 examples/case-pack-2.zip（跨包补链 / 重复合并 / ID 冲突三类场景）
+
+# ---------------------------------------------------------------- 8. 上传两个包并等待完成
+JOB1=$(curl -s -X POST "$BASE/api/v1/jobs" \
+  -F 'file=@examples/case-pack-1.zip;type=application/zip' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+JOB2=$(curl -s -X POST "$BASE/api/v1/jobs" \
+  -F 'file=@examples/case-pack-2.zip;type=application/zip' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+for J in "$JOB1" "$JOB2"; do
+  while :; do
+    S=$(curl -s "$BASE/api/v1/jobs/$J" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+    [ "$S" = completed ] && break
+    [ "$S" = failed ] && { echo "作业失败: $J"; exit 1; }
+    sleep 0.5
+  done
+done
+
+# ---------------------------------------------------------------- 9. 创建案件并轮询
+CASE_JSON=$(curl -s -X POST "$BASE/api/v1/cases" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\": \"合同谈判合并\", \"job_ids\": [\"$JOB1\", \"$JOB2\"]}")
+echo "$CASE_JSON"
+CASE_ID=$(python3 -c "import json,sys; print(json.loads(sys.stdin.read())['id'])" <<<"$CASE_JSON")
+while :; do
+  CASE=$(curl -s "$BASE/api/v1/cases/$CASE_ID")
+  STATUS=$(python3 -c "import json,sys; print(json.load(sys.stdin)['status'])" <<<"$CASE")
+  echo "$CASE" | python3 -c "import json,sys; j=json.load(sys.stdin); print(j['status'], j['progress'], j['phase'])"
+  if [ "$STATUS" = completed ] || [ "$STATUS" = failed ]; then break; fi
+  sleep 0.5
+done
+# 各作业贡献 / 重复 / 冲突 / 补链统计
+echo "$CASE" | python3 -m json.tool
+
+# ---------------------------------------------------------------- 10. 读取合并树
+# 完整树（sources 保留全部来源；merge_info 记录重复/冲突/补链依据）
+curl -s "$BASE/api/v1/cases/$CASE_ID/tree" | python3 -m json.tool
+# 紧凑视图
+curl -s "$BASE/api/v1/cases/$CASE_ID/tree?view=compact" | python3 -m json.tool
+
+# ---------------------------------------------------------------- 11. 下载案件结果 JSON
+curl -s -D - "$BASE/api/v1/cases/$CASE_ID/result" -o "/tmp/${CASE_ID}.case-result.json"
+python3 -m json.tool "/tmp/${CASE_ID}.case-result.json" | head -40 || true
+
+# ---------------------------------------------------------------- 12. 删除源作业不影响案件结果
+curl -s -X DELETE "$BASE/api/v1/jobs/$JOB1"; echo
+curl -s -X DELETE "$BASE/api/v1/jobs/$JOB2"; echo
+curl -s "$BASE/api/v1/cases/$CASE_ID/tree" | python3 -c \
+  "import json,sys; print('案件结果仍可读，根节点数:', len(json.load(sys.stdin)['threads']))"
+
+# ---------------------------------------------------------------- 13. 创建案件的拒绝场景
+# 源作业不存在：404 job_not_found
+curl -s -X POST "$BASE/api/v1/cases" -H 'Content-Type: application/json' \
+  -d '{"job_ids": ["00000000-0000-0000-0000-000000000000"]}'; echo
+# 同一作业重复提交：409 duplicate_job（先重新上传一个作业）
+# J=$(curl -s -X POST "$BASE/api/v1/jobs" -F 'file=@examples/case-pack-1.zip;type=application/zip' | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+# curl -s -X POST "$BASE/api/v1/cases" -H 'Content-Type: application/json' \
+#   -d "{\"job_ids\": [\"$J\", \"$J\"]}"
