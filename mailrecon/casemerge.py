@@ -34,7 +34,7 @@ _AMBIGUOUS = -1
 _CONTENT_FIELDS = (
     "message_id", "raw_sha256", "in_reply_to", "references", "date",
     "from", "to", "cc", "subject", "body_text", "body_html_present",
-    "attachments",
+    "attachments", "received",
 )
 
 
@@ -210,7 +210,9 @@ def _source_entry(job_id: str, src: dict[str, Any]) -> dict[str, Any]:
 def _new_merged_node(
     uid: int, job_id: str, src: dict[str, Any]
 ) -> dict[str, Any]:
-    node = {field: src[field] for field in _CONTENT_FIELDS}
+    node = {field: src[field] for field in _CONTENT_FIELDS if field in src}
+    # 旧版本作业结果没有 received 字段，按空链处理（不猜测）
+    node.setdefault("received", [])
     node["uid"] = uid
     node["sources"] = [_source_entry(job_id, src)]
     # 原始问题保留来源作业中的原文（同一 SHA-256 解析结果一致，

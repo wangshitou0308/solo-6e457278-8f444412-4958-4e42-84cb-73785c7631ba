@@ -11,6 +11,11 @@
 
     DATA_DIR/cases/<case_id>/
         result.json    # 跨包合并完成后的会话森林
+
+时序核验分析目录布局（同样独立落盘，删除源作业/案件不影响已完成分析）::
+
+    DATA_DIR/analyses/<analysis_id>/
+        result.json    # 时序核验结论与时间线
 """
 
 from __future__ import annotations
@@ -56,6 +61,22 @@ CREATE TABLE IF NOT EXISTS cases (
     job_ids_json      TEXT NOT NULL,
     email_count       INTEGER NOT NULL DEFAULT 0,
     thread_count      INTEGER NOT NULL DEFAULT 0,
+    stats_json        TEXT,
+    result_path       TEXT
+);
+CREATE TABLE IF NOT EXISTS analyses (
+    id                TEXT PRIMARY KEY,
+    status            TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    target_type       TEXT NOT NULL,
+    target_id         TEXT NOT NULL,
+    thresholds_json   TEXT NOT NULL,
+    progress          INTEGER NOT NULL DEFAULT 0,
+    phase             TEXT,
+    error             TEXT,
+    email_count       INTEGER NOT NULL DEFAULT 0,
+    finding_count     INTEGER NOT NULL DEFAULT 0,
     stats_json        TEXT,
     result_path       TEXT
 );
@@ -351,6 +372,139 @@ class Storage:
             ).fetchall()
         return [_case_row_to_dict(row) for row in rows]
 
+    # ---------------------------------------------------------- 分析目录
+
+    @staticmethod
+    def analysis_dir(analysis_id: str) -> Path:
+        return config.DATA_DIR / "analyses" / analysis_id
+
+    @classmethod
+    def prepare_analysis_dir(cls, analysis_id: str) -> Path:
+        path = cls.analysis_dir(analysis_id)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    # ---------------------------------------------------------- 分析 CRUD
+
+    def create_analysis(
+        self,
+        analysis_id: str,
+        target_type: str,
+        target_id: str,
+        thresholds: dict[str, int],
+    ) -> None:
+        now = utc_now()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO analyses (id, status, created_at, updated_at,
+                                      target_type, target_id, thresholds_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    analysis_id,
+                    config.STATUS_QUEUED,
+                    now,
+                    now,
+                    target_type,
+                    target_id,
+                    json.dumps(thresholds),
+                ),
+            )
+
+    def get_analysis(self, analysis_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM analyses WHERE id = ?", (analysis_id,)
+            ).fetchone()
+        return _analysis_row_to_dict(row) if row else None
+
+    def list_analyses(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM analyses ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [_analysis_row_to_dict(row) for row in rows]
+
+    def update_analysis_progress(
+        self,
+        analysis_id: str,
+        status: str | None = None,
+        progress: int | None = None,
+        phase: str | None = None,
+    ) -> None:
+        sets = ["updated_at = ?"]
+        params: list[Any] = [utc_now()]
+        if status is not None:
+            sets.append("status = ?")
+            params.append(status)
+        if progress is not None:
+            sets.append("progress = ?")
+            params.append(progress)
+        if phase is not None:
+            sets.append("phase = ?")
+            params.append(phase)
+        params.append(analysis_id)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE analyses SET {', '.join(sets)} WHERE id = ?", params
+            )
+
+    def complete_analysis(
+        self,
+        analysis_id: str,
+        result_path: str,
+        email_count: int,
+        finding_count: int,
+        stats: dict[str, Any],
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE analyses SET status = ?, updated_at = ?, progress = 100,
+                                    phase = ?, error = NULL, email_count = ?,
+                                    finding_count = ?, stats_json = ?,
+                                    result_path = ?
+                WHERE id = ?
+                """,
+                (
+                    config.STATUS_COMPLETED,
+                    utc_now(),
+                    "completed",
+                    email_count,
+                    finding_count,
+                    json.dumps(stats, ensure_ascii=False),
+                    result_path,
+                    analysis_id,
+                ),
+            )
+
+    def fail_analysis(self, analysis_id: str, error: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE analyses SET status = ?, updated_at = ?, phase = ?,
+                                    error = ? WHERE id = ?
+                """,
+                (
+                    config.STATUS_FAILED,
+                    utc_now(),
+                    "failed",
+                    error,
+                    analysis_id,
+                ),
+            )
+
+    def unfinished_analyses(self) -> list[dict[str, Any]]:
+        """服务重启后找出卡在 processing/queued 的分析。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM analyses WHERE status IN (?, ?)",
+                (config.STATUS_PROCESSING, config.STATUS_QUEUED),
+            ).fetchall()
+        return [_analysis_row_to_dict(row) for row in rows]
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -369,6 +523,16 @@ def _case_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         data["job_ids"] = json.loads(data.pop("job_ids_json"))
     except (json.JSONDecodeError, TypeError):
         data["job_ids"] = []
+    return data
+
+
+def _analysis_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    data["stats"] = _parse_stats(data.pop("stats_json", None))
+    try:
+        data["thresholds"] = json.loads(data.pop("thresholds_json"))
+    except (json.JSONDecodeError, TypeError):
+        data["thresholds"] = {}
     return data
 
 

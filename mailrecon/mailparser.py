@@ -15,6 +15,8 @@ from email.policy import default
 from email.utils import getaddresses, parsedate_to_datetime
 from typing import Any
 
+from .received import parse_received_headers
+
 # 从裸文本里提取 <msg-id@host> 形态标识
 _MSGID_RE = re.compile(r"<[^<>@\s]+@[^<>\s]+>")
 # References 里偶见没有尖括号的 token，兜底拆分
@@ -46,6 +48,7 @@ def parse_eml(raw: bytes, source_name: str) -> dict[str, Any]:
             "body_text": "",
             "body_html_present": False,
             "attachments": [],
+            "received": [],
             "issues": [f"MIME 结构无法解析: {type(exc).__name__}: {exc}"],
         }
 
@@ -79,6 +82,10 @@ def parse_eml(raw: bytes, source_name: str) -> dict[str, Any]:
     attachments, att_issues = _extract_attachments(msg)
     issues.extend(att_issues)
 
+    # Received 头全部保留（原始顺序），逐跳解析时间/主机；问题只进该跳的
+    # issues，不阻断解析
+    received = parse_received_headers(msg.get_all("Received", []))
+
     return {
         "source_file": source_name,
         "raw_sha256": raw_sha,
@@ -93,6 +100,7 @@ def parse_eml(raw: bytes, source_name: str) -> dict[str, Any]:
         "body_text": body_text,
         "body_html_present": html_present,
         "attachments": attachments,
+        "received": received,
         "issues": issues,
     }
 

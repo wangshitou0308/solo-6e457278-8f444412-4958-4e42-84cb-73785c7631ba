@@ -62,6 +62,7 @@ def build_threads(records: list[dict[str, Any]]) -> dict[str, Any]:
             "body_text": rec["body_text"],
             "body_html_present": rec.get("body_html_present", False),
             "attachments": rec["attachments"],
+            "received": rec.get("received", []),
             "issues": list(rec["issues"]),
             "children": [],
         }

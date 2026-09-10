@@ -55,6 +55,19 @@ MAX_CASE_JOBS = _int_env("MAILRECON_MAX_CASE_JOBS", 100)
 # 单个案件允许合并的邮件总量上限（各源作业 email_count 之和）
 MAX_CASE_EMAILS = _int_env("MAILRECON_MAX_CASE_EMAILS", 100_000)
 
+# 时序核验默认阈值：客户端时钟偏差容差（秒）
+DEFAULT_CLOCK_SKEW_SECONDS = _int_env(
+    "MAILRECON_DEFAULT_CLOCK_SKEW_SECONDS", 120
+)
+# 时序核验默认阈值：单跳传输耗时上限（秒）
+DEFAULT_MAX_TRANSIT_SECONDS = _int_env(
+    "MAILRECON_DEFAULT_MAX_TRANSIT_SECONDS", 300
+)
+# 用户可配置阈值的上限（秒），防止误填超大值导致核验失效
+MAX_THRESHOLD_SECONDS = _int_env(
+    "MAILRECON_MAX_THRESHOLD_SECONDS", 7 * 24 * 3600
+)
+
 # 作业状态
 STATUS_QUEUED = "queued"
 STATUS_PROCESSING = "processing"

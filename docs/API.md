@@ -10,6 +10,8 @@
   当响应 JSON 嵌套深度超过 500 层时，接口自动由缩进格式切换为紧凑
   JSON（内容结构不变），以避免闭合缩进带来的 O(深度²) 体积膨胀；
   落盘结果文件统一使用紧凑 JSON。
+- 时序核验：每封邮件的全部 `Received` 头按原顺序解析保留（见第 4 节
+  节点字段），可对已完成的作业/案件创建后台时序核验分析（第 12–15 节）。
 
 ## 1. 创建作业
 
@@ -145,6 +147,18 @@ GET /api/v1/jobs/{job_id}/tree?view=compact
           "sha256": "b6d5f438…"
         }
       ],
+      "received": [
+        {
+          "index": 0,
+          "raw": "from mail.example.com by mx.example.org with ESMTPS; Mon, 01 Sep 2026 09:00:20 +0000",
+          "from_host": "mail.example.com",
+          "by_host": "mx.example.org",
+          "time_utc": "2026-09-01T09:00:20+00:00",
+          "time_original": "2026-09-01T09:00:20+00:00",
+          "timezone": "+0000",
+          "issues": []
+        }
+      ],
       "issues": [],
       "children": [ { } ]
     }
@@ -158,6 +172,12 @@ GET /api/v1/jobs/{job_id}/tree?view=compact
   并置 `body_html_present: true`；
 * 附件**永远只有** `filename` / `content_type` / `size` / `sha256`，
   接口不返回任何附件二进制；
+* `received` 按**邮件头中的原始出现顺序**保留全部 Received 跳点
+  （`index` 0 = 最上方 = 传输路径上的最后一跳；路径方向为 index 从大到小）。
+  每跳提取 `from_host`（发送主机）、`by_host`（接收主机）与时间：
+  `time_utc` 为换算后的 UTC 时间，`time_original` 为原始时区下的时间，
+  `timezone` 为原始时区标记（如 `+0200`、`GMT`）。**缺时区、无法解析时
+  不做任何猜测**：对应字段为 `null`，原因写入该跳的 `issues`；
 * 节点 `issues` 为该邮件的问题说明（中文人类可读）；
 * `compact` 视图省略正文、附件明细与问题明细，只保留
   `issue_count`、`attachment_count` 等摘要，便于浏览大树。
@@ -402,6 +422,202 @@ Content-Disposition: attachment; filename="<case_id>.case-result.json"
 删除源作业不影响案件结果的读取与下载；服务重启后，未完成的案件会
 自动重新入队处理。
 
+## 12. 创建时序核验分析
+
+```
+POST /api/v1/analyses
+Content-Type: application/json
+```
+
+对一个**已完成**的作业或案件做邮件传输时序核验：结合 `Date`、
+`Received` 跳点链与会话父子关系，按可配置阈值标出时序异常。
+
+**请求体**
+
+```json
+{
+  "target_type": "job",
+  "target_id": "<已完成作业或案件的UUID>",
+  "thresholds": {
+    "clock_skew_seconds": 120,
+    "max_transit_seconds": 300
+  }
+}
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `target_type` | 是 | `"job"` 或 `"case"` |
+| `target_id` | 是 | 目标作业/案件 UUID |
+| `thresholds` | 否 | 阈值对象，缺省项用默认值；两项均须为 0 到 `MAILRECON_MAX_THRESHOLD_SECONDS`（默认 604800）之间的整数 |
+| `thresholds.clock_skew_seconds` | 否 | 客户端时钟偏差容差（秒），默认 `MAILRECON_DEFAULT_CLOCK_SKEW_SECONDS`（120） |
+| `thresholds.max_transit_seconds` | 否 | 单跳传输耗时上限（秒），默认 `MAILRECON_DEFAULT_MAX_TRANSIT_SECONDS`（300） |
+
+**响应** `201 Created`：
+
+```json
+{
+  "id": "59329c0d-99b5-414b-b9c9-a59b5b314402",
+  "status": "queued",
+  "created_at": "2026-09-10T20:48:11+00:00",
+  "updated_at": "2026-09-10T20:48:11+00:00",
+  "target_type": "job",
+  "target_id": "a0816b74-...",
+  "thresholds": { "clock_skew_seconds": 120, "max_transit_seconds": 300 },
+  "progress": 0,
+  "phase": null,
+  "error": null,
+  "email_count": 0,
+  "finding_count": 0,
+  "stats": null
+}
+```
+
+**创建即校验**：目标不存在或已删除返回 `404 target_not_found`；
+目标未完成返回 `409 target_not_completed`；阈值非法返回
+`400 bad_request`。
+
+## 13. 查询分析进度 / 分析列表
+
+```
+GET /api/v1/analyses/{analysis_id}
+GET /api/v1/analyses
+```
+
+`status`：`queued` → `processing` → `completed` | `failed`
+
+`phase` 依次为：`loading_target`、`flattening_threads`、
+`checking_timing`、`writing_result`、`completed` / `failed`。
+
+`failed` 时 `error` 给出原因（例如目标在分析处理前被删除）。
+完成后 `stats` 结构：
+
+```json
+{
+  "emails": 6,
+  "emails_with_received": 5,
+  "hops_total": 9,
+  "hops_with_issues": 1,
+  "findings_total": 5,
+  "findings_by_type": {
+    "client_clock_skew": 2,
+    "abnormal_transit": 1,
+    "hop_time_inversion": 1,
+    "reply_before_parent": 1,
+    "chain_mismatch": 0
+  }
+}
+```
+
+## 14. 读取分析时间线（按时间/异常类型筛选）
+
+```
+GET /api/v1/analyses/{analysis_id}/timeline
+GET /api/v1/analyses/{analysis_id}/timeline?from=2026-09-01T09:00:00%2B00:00&to=2026-09-02T00:00:00%2B00:00
+GET /api/v1/analyses/{analysis_id}/timeline?type=client_clock_skew
+```
+
+仅在 `completed` 后可用，否则 `409 not_ready`。查询参数可组合：
+
+| 参数 | 说明 |
+|---|---|
+| `from` / `to` | 时间区间边界，ISO 8601 且**必须带时区**（缺时区返回 400，不做时区猜测）；无定位时间的条目在给出时间筛选时不返回（无法判断，不猜测） |
+| `type` | 异常类型，须为 `client_clock_skew` / `abnormal_transit` / `hop_time_inversion` / `reply_before_parent` / `chain_mismatch` 之一，未知值返回 400 并列出可选值 |
+
+响应：
+
+```json
+{
+  "analysis_id": "...",
+  "target_type": "job",
+  "target_id": "...",
+  "thresholds": { "clock_skew_seconds": 120, "max_transit_seconds": 300 },
+  "filters": { "from": null, "to": null, "type": "client_clock_skew" },
+  "entry_count": 1,
+  "entries": [
+    {
+      "node_uid": 1,
+      "message_id": "<timing-skew@example.com>",
+      "subject": "补充材料（发送端时钟异常）",
+      "from": { "name": "李雷", "address": "lilei@example.com" },
+      "date": "2026-09-01T09:00:00+00:00",
+      "time": "2026-09-01T09:00:00+00:00",
+      "time_basis": "date",
+      "hop_count": 1,
+      "source": { "job_id": "...", "source_file": "02-clock-skew.eml" },
+      "finding_ids": ["F0001"],
+      "notes": [],
+      "findings": [
+        {
+          "id": "F0001",
+          "type": "client_clock_skew",
+          "time": "2026-09-01T09:00:00+00:00",
+          "node_uids": [1],
+          "message_ids": ["<timing-skew@example.com>"],
+          "summary": "Date 头与首跳接收时间相差 720 秒，超过时钟偏差阈值 120 秒，疑似客户端时钟偏慢",
+          "fields": ["Date", "Received"],
+          "thresholds": { "clock_skew_seconds": 120 },
+          "evidence": {
+            "date_header": "2026-09-01T09:00:00+00:00",
+            "first_hop": { "index": 0, "from_host": "client-han", "by_host": "mail.example.com", "time_utc": "2026-09-01T09:12:00+00:00", "timezone": "+0000" },
+            "skew_seconds": 720.0,
+            "direction": "client_behind"
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+约定：
+
+* 条目按定位时间 `time` 升序；`time` 优先取 `Date`（时区可用时，
+  `time_basis="date"`），否则取最早一跳的 UTC 时间
+  （`time_basis="received"`），都不可用时为 `null`（排在最后）；
+* `notes` 列出该邮件无法执行的检查及原因（如 Date 缺时区、某跳
+  Received 无法解析），与结论一样只说明、不猜测；
+* `findings` 为该条目命中的结论（给出 `type` 筛选时只含该类型）；
+  每条结论都带 `fields`（判定所用字段）、`thresholds`（本次判定
+  使用的阈值，无阈值类结论为 `{}`）与 `evidence`（具体取值）；
+* 时间线条目的 `source`：作业分析为 `{job_id, source_file}`，
+  案件分析为 `{case_id, sources}`（含全部来源作业）。
+
+### 结论类型与证据结构
+
+| type | 含义 | 关键 evidence |
+|---|---|---|
+| `client_clock_skew` | `Date` 与首跳接收时间差超过 `clock_skew_seconds` | `date_header`、`first_hop`、`skew_seconds`、`direction`（`client_behind`/`client_ahead`） |
+| `abnormal_transit` | 相邻两跳间隔超过 `max_transit_seconds` | `gap_seconds`、`earlier_hop`、`later_hop` |
+| `hop_time_inversion` | 相邻两跳时间逆序（不猜测原因） | `gap_seconds`（负值）、`earlier_hop`、`later_hop` |
+| `reply_before_parent` | 回复的 `Date` 早于父邮件超过 `clock_skew_seconds` 容差 | `reply`、`parent`、`diff_seconds` |
+| `chain_mismatch` | 同一 Message-ID 不同来源的 Received 链不一致 | `variants`：各版本传输链**并列**（`raw_sha256`、`sources`、`hops`），不做取舍 |
+
+跳点编号 `index` 一律按 Received 头在邮件中的出现顺序（0 = 最上方 =
+最后一跳）。缺可用时间的跳不参与相邻比较，原因记录在该跳的
+`issues` 与条目的 `notes` 中。
+
+## 15. 下载分析结果 JSON
+
+```
+GET /api/v1/analyses/{analysis_id}/result
+```
+
+`200`，响应头：
+
+```
+Content-Type: application/json; charset=utf-8
+Content-Disposition: attachment; filename="<analysis_id>.analysis-result.json"
+```
+
+响应体为完整结果文件（顶层含 `analysis_id`、`target_type`、
+`target_id`、`target`、`thresholds`、`stats`、`findings`、
+`timeline`）。完成前请求返回 `409 not_ready`。
+
+**结果独立落盘**（`DATA_DIR/analyses/<analysis_id>/result.json`）：
+分析完成后删除源作业/案件不影响结果的读取与下载；服务重启后，
+未完成的分析会自动重新入队处理（沿用创建时的阈值）。
+
 ## 错误响应格式
 
 所有错误统一为：
@@ -413,19 +629,21 @@ Content-Disposition: attachment; filename="<case_id>.case-result.json"
 
 | 状态码 | code | 触发场景 |
 |---|---|---|
-| 400 | `bad_request` | 请求体为空、multipart 缺 `file`、作业/案件 ID 格式非法、Idempotency-Key 格式非法、案件请求体非合法 JSON、案件作业数超限 |
-| 404 | `not_found` | 路径或作业/案件不存在 |
+| 400 | `bad_request` | 请求体为空、multipart 缺 `file`、作业/案件/分析 ID 格式非法、Idempotency-Key 格式非法、案件/分析请求体非合法 JSON、案件作业数超限、分析阈值非法、时间线筛选参数非法 |
+| 404 | `not_found` | 路径或作业/案件/分析不存在 |
 | 404 | `job_not_found` | 创建案件时引用的源作业不存在或已删除 |
+| 404 | `target_not_found` | 创建分析时引用的目标作业/案件不存在或已删除 |
 | 409 | `idempotency_conflict` | 同 Key 不同内容 |
-| 409 | `not_ready` | 作业/案件未完成时取树/结果 |
+| 409 | `not_ready` | 作业/案件/分析未完成时取树/时间线/结果 |
 | 409 | `job_processing` | 删除正在处理的作业 |
 | 409 | `job_not_completed` | 创建案件时引用的源作业未完成 |
+| 409 | `target_not_completed` | 创建分析时引用的目标作业/案件未完成 |
 | 409 | `duplicate_job` | 同一作业在同一案件中重复提交 |
 | 409 | `case_too_large` | 案件邮件总量超过 `MAILRECON_MAX_CASE_EMAILS` |
 | 411 | `length_required` | 缺 Content-Length |
 | 413 | `payload_too_large` | 超过上传体积上限 |
 | 415 | `unsupported_media_type` | Content-Type 不是支持的类型 |
-| 500 | `internal_error` | 未预期内部错误（作业/案件内部异常会落为对应 `failed`，不会返回 500） |
+| 500 | `internal_error` | 未预期内部错误（作业/案件/分析内部异常会落为对应 `failed`，不会返回 500） |
 
 ZIP 安全/超限问题不使用上述 HTTP 错误码——上传会被受理（201），
 后台校验失败后体现在作业的 `status=failed` 与 `error` 文本中，

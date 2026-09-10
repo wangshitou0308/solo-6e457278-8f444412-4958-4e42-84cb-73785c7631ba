@@ -6,15 +6,17 @@ import hashlib
 import re
 import threading
 import uuid
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from . import config, jsonio
+from . import config, jsonio, timing
 from .caseproc import CaseProcessor
 from .processor import JobProcessor
 from .storage import Storage
+from .timeproc import TimingProcessor
 
 _UUID_RE = re.compile(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")
 _IDEMPOTENCY_RE = re.compile(r"^[\x21-\x7E]{8,200}$")
@@ -109,6 +111,7 @@ class Handler(BaseHTTPRequestHandler):
     storage: Storage
     processor: JobProcessor
     case_processor: CaseProcessor
+    timing_processor: TimingProcessor
     create_lock: threading.Lock
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -182,6 +185,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"status": "ok", "version": "1.0.0"})
             elif path == "/api/v1/jobs":
                 self._list_jobs()
+            elif path == "/api/v1/analyses":
+                self._list_analyses()
             else:
                 match = re.fullmatch(r"/api/v1/jobs/([^/]+)", path)
                 if match:
@@ -207,6 +212,22 @@ class Handler(BaseHTTPRequestHandler):
                 if match:
                     self._get_case_result(match.group(1))
                     return
+                match = re.fullmatch(r"/api/v1/analyses/([^/]+)", path)
+                if match:
+                    self._get_analysis(match.group(1))
+                    return
+                match = re.fullmatch(
+                    r"/api/v1/analyses/([^/]+)/timeline", path
+                )
+                if match:
+                    self._get_analysis_timeline(match.group(1), query)
+                    return
+                match = re.fullmatch(
+                    r"/api/v1/analyses/([^/]+)/result", path
+                )
+                if match:
+                    self._get_analysis_result(match.group(1))
+                    return
                 self._error(404, "not_found", f"未知路径: {self.path}")
         except ApiError as exc:
             self._error(exc.status, exc.code, exc.message)
@@ -221,6 +242,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._create_job()
             elif path == "/api/v1/cases":
                 self._create_case()
+            elif path == "/api/v1/analyses":
+                self._create_analysis()
             else:
                 self._error(404, "not_found", f"未知路径: {self.path}")
         except ApiError as exc:
@@ -547,6 +570,183 @@ class Handler(BaseHTTPRequestHandler):
         download_name = f"{case['id']}.case-result.json"
         self._file_download(Path(case["result_path"]), download_name)
 
+    # ------------------------------------------------------ 时序核验分析端点
+
+    def _public_analysis(self, analysis: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": analysis["id"],
+            "status": analysis["status"],
+            "created_at": analysis["created_at"],
+            "updated_at": analysis["updated_at"],
+            "target_type": analysis["target_type"],
+            "target_id": analysis["target_id"],
+            "thresholds": analysis["thresholds"],
+            "progress": analysis["progress"],
+            "phase": analysis["phase"],
+            "error": analysis["error"],
+            "email_count": analysis["email_count"],
+            "finding_count": analysis["finding_count"],
+            "stats": analysis["stats"],
+        }
+
+    def _require_analysis(self, analysis_id: str) -> dict[str, Any]:
+        if not _UUID_RE.fullmatch(analysis_id):
+            raise ApiError(400, "bad_request", "分析 ID 格式非法")
+        analysis = self.storage.get_analysis(analysis_id)
+        if analysis is None:
+            raise ApiError(404, "not_found", f"分析不存在: {analysis_id}")
+        return analysis
+
+    def _list_analyses(self) -> None:
+        analyses = self.storage.list_analyses()
+        self._json(200, {"analyses": [self._public_analysis(a) for a in analyses]})
+
+    def _create_analysis(self) -> None:
+        content_type = self.headers.get("Content-Type", "")
+        if content_type.lower().split(";")[0].strip() != "application/json":
+            raise ApiError(
+                415,
+                "unsupported_media_type",
+                "创建分析请使用 application/json 请求体",
+            )
+        body = self._read_body_capped()
+        if not body:
+            raise ApiError(400, "bad_request", "请求体为空")
+        try:
+            payload = jsonio.loads(body)
+        except Exception:
+            raise ApiError(400, "bad_request", "请求体不是合法 JSON")
+        if not isinstance(payload, dict):
+            raise ApiError(400, "bad_request", "请求体必须是 JSON 对象")
+
+        target_type = payload.get("target_type")
+        if target_type not in ("job", "case"):
+            raise ApiError(
+                400, "bad_request", "target_type 必须是 \"job\" 或 \"case\""
+            )
+        target_id = payload.get("target_id")
+        if not isinstance(target_id, str) or not _UUID_RE.fullmatch(target_id):
+            raise ApiError(400, "bad_request", "target_id 必须是作业/案件 UUID")
+
+        thresholds = _parse_thresholds(payload.get("thresholds"))
+
+        with self.create_lock:
+            if target_type == "job":
+                target = self.storage.get_job(target_id)
+                label = "作业"
+            else:
+                target = self.storage.get_case(target_id)
+                label = "案件"
+            if target is None:
+                raise ApiError(
+                    404,
+                    "target_not_found",
+                    f"目标{label}不存在或已被删除: {target_id}",
+                )
+            if target["status"] != config.STATUS_COMPLETED:
+                raise ApiError(
+                    409,
+                    "target_not_completed",
+                    f"目标{label}未完成，不能创建时序核验分析: {target_id} "
+                    f"(当前状态: {target['status']})",
+                )
+            analysis_id = str(uuid.uuid4())
+            Storage.prepare_analysis_dir(analysis_id)
+            self.storage.create_analysis(
+                analysis_id, target_type, target_id, thresholds
+            )
+
+        self.timing_processor.enqueue(analysis_id)
+        analysis = self.storage.get_analysis(analysis_id)
+        self._json(201, self._public_analysis(analysis))
+
+    def _get_analysis(self, analysis_id: str) -> None:
+        self._json(200, self._public_analysis(self._require_analysis(analysis_id)))
+
+    def _completed_analysis_result(
+        self, analysis_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        analysis = self._require_analysis(analysis_id)
+        if (
+            analysis["status"] != config.STATUS_COMPLETED
+            or not analysis["result_path"]
+        ):
+            raise ApiError(
+                409,
+                "not_ready",
+                f"分析尚未完成 (当前状态: {analysis['status']})",
+            )
+        result = jsonio.loads(Path(analysis["result_path"]).read_text("utf-8"))
+        return analysis, result
+
+    def _get_analysis_timeline(
+        self, analysis_id: str, query: dict[str, list[str]]
+    ) -> None:
+        analysis, result = self._completed_analysis_result(analysis_id)
+
+        # ---- 筛选参数解析（非法输入明确拒绝，不静默忽略） ----------------
+        time_from = _parse_time_filter(query.get("from"), "from")
+        time_to = _parse_time_filter(query.get("to"), "to")
+        type_filter = None
+        raw_types = query.get("type")
+        if raw_types:
+            type_filter = raw_types[0]
+            if type_filter not in timing.FINDING_TYPES:
+                raise ApiError(
+                    400,
+                    "bad_request",
+                    f"未知异常类型: {type_filter!r}，可选: "
+                    + ", ".join(timing.FINDING_TYPES),
+                )
+
+        findings_by_id = {f["id"]: f for f in result["findings"]}
+
+        entries: list[dict[str, Any]] = []
+        for entry in result["timeline"]:
+            if time_from is not None or time_to is not None:
+                # 无定位时间的条目无法判断是否落在区间内，不猜测，直接排除
+                if not entry["time"]:
+                    continue
+                entry_time = datetime.fromisoformat(entry["time"])
+                if time_from is not None and entry_time < time_from:
+                    continue
+                if time_to is not None and entry_time > time_to:
+                    continue
+            entry_findings = [
+                findings_by_id[fid]
+                for fid in entry["finding_ids"]
+                if fid in findings_by_id
+            ]
+            if type_filter is not None:
+                entry_findings = [
+                    f for f in entry_findings if f["type"] == type_filter
+                ]
+                if not entry_findings:
+                    continue
+            entries.append({**entry, "findings": entry_findings})
+
+        self._json(
+            200,
+            {
+                "analysis_id": analysis_id,
+                "target_type": analysis["target_type"],
+                "target_id": analysis["target_id"],
+                "thresholds": analysis["thresholds"],
+                "filters": {
+                    "from": query.get("from", [None])[0],
+                    "to": query.get("to", [None])[0],
+                    "type": type_filter,
+                },
+                "entry_count": len(entries),
+                "entries": entries,
+            },
+        )
+
+    def _get_analysis_result(self, analysis_id: str) -> None:
+        analysis, _ = self._completed_analysis_result(analysis_id)
+        download_name = f"{analysis['id']}.analysis-result.json"
+        self._file_download(Path(analysis["result_path"]), download_name)
+
 
 def _compact_forest(
     roots: list[dict[str, Any]],
@@ -614,6 +814,68 @@ def _basename(filename: str | None) -> str:
     return clean[:255]
 
 
+# 时序核验阈值：键 -> 默认值（来自 config，可被环境变量覆盖）
+_THRESHOLD_DEFAULTS = {
+    "clock_skew_seconds": config.DEFAULT_CLOCK_SKEW_SECONDS,
+    "max_transit_seconds": config.DEFAULT_MAX_TRANSIT_SECONDS,
+}
+
+
+def _parse_thresholds(raw: Any) -> dict[str, int]:
+    """校验用户提交的阈值；缺省项用默认值，非法输入明确拒绝。"""
+    thresholds = dict(_THRESHOLD_DEFAULTS)
+    if raw is None:
+        return thresholds
+    if not isinstance(raw, dict):
+        raise ApiError(400, "bad_request", "thresholds 必须是 JSON 对象")
+    for key, value in raw.items():
+        if key not in thresholds:
+            raise ApiError(
+                400,
+                "bad_request",
+                f"未知阈值项: {key!r}，可选: " + ", ".join(thresholds),
+            )
+        # bool 是 int 子类，明确排除
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ApiError(
+                400, "bad_request", f"阈值 {key} 必须是非负整数（秒）"
+            )
+        if value < 0 or value > config.MAX_THRESHOLD_SECONDS:
+            raise ApiError(
+                400,
+                "bad_request",
+                f"阈值 {key} 须在 0 到 {config.MAX_THRESHOLD_SECONDS} 秒之间，"
+                f"实际为 {value}",
+            )
+        thresholds[key] = value
+    return thresholds
+
+
+def _parse_time_filter(
+    raw_values: list[str] | None, name: str
+) -> datetime | None:
+    """解析时间线筛选的时间边界；缺时区不猜测，直接 400。"""
+    if not raw_values:
+        return None
+    raw = raw_values[0]
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        raise ApiError(
+            400,
+            "bad_request",
+            f"筛选参数 {name} 不是合法 ISO 8601 时间: {raw!r}",
+        ) from None
+    if dt.tzinfo is None:
+        raise ApiError(
+            400,
+            "bad_request",
+            f"筛选参数 {name} 必须带时区（如 2026-09-01T00:00:00+00:00），"
+            "不做时区猜测",
+        )
+    return dt
+
+
 # ---------------------------------------------------------------- 服务装配
 
 class ApiServer(ThreadingHTTPServer):
@@ -625,21 +887,25 @@ class ApiServer(ThreadingHTTPServer):
         self.storage = Storage()
         self.processor = JobProcessor(self.storage)
         self.case_processor = CaseProcessor(self.storage)
+        self.timing_processor = TimingProcessor(self.storage)
         self.create_lock = threading.Lock()
         # 注入给 Handler 实例使用
         Handler.storage = self.storage
         Handler.processor = self.processor
         Handler.case_processor = self.case_processor
+        Handler.timing_processor = self.timing_processor
         Handler.create_lock = self.create_lock
 
     def start(self) -> None:
         """启动后台处理线程（serve_forever 由调用方驱动）。"""
         self.processor.start()
         self.case_processor.start()
+        self.timing_processor.start()
 
     def serve(self) -> None:
         self.processor.start()
         self.case_processor.start()
+        self.timing_processor.start()
         try:
             self.serve_forever()
         finally:

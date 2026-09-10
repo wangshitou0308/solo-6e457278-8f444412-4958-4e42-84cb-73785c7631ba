@@ -127,3 +127,89 @@ curl -s -X POST "$BASE/api/v1/cases" -H 'Content-Type: application/json' \
 # J=$(curl -s -X POST "$BASE/api/v1/jobs" -F 'file=@examples/case-pack-1.zip;type=application/zip' | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
 # curl -s -X POST "$BASE/api/v1/cases" -H 'Content-Type: application/json' \
 #   -d "{\"job_ids\": [\"$J\", \"$J\"]}"
+
+# ================================================================ 时序核验分析
+# 前置：python3 scripts/make_timing_sample.py 生成
+#   examples/timing-mails.zip      正常多跳 / 时钟偏差 / 传输耗时 / 跳逆序 / 回复早于父邮件
+#   examples/timing-chain-{a,b}.zip 同一 Message-ID 传输链不同（案件级并列展示）
+
+# ---------------------------------------------------------------- 14. 上传时序示例包并创建分析
+TIMING_JOB=$(curl -s -X POST "$BASE/api/v1/jobs" \
+  -F 'file=@examples/timing-mails.zip;type=application/zip' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+while :; do
+  S=$(curl -s "$BASE/api/v1/jobs/$TIMING_JOB" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+  [ "$S" = completed ] && break
+  [ "$S" = failed ] && { echo "作业失败: $TIMING_JOB"; exit 1; }
+  sleep 0.5
+done
+# 作业树节点带 received 跳点（原顺序保留，UTC + 原始时区）
+curl -s "$BASE/api/v1/jobs/$TIMING_JOB/tree" | python3 -c \
+  "import json,sys; n=json.load(sys.stdin)['threads'][0]; print(json.dumps(n['received'], ensure_ascii=False, indent=2))"
+
+# 创建分析：自定义时钟偏差与传输耗时阈值（缺省用默认值 120/300 秒）
+AN_JSON=$(curl -s -X POST "$BASE/api/v1/analyses" \
+  -H 'Content-Type: application/json' \
+  -d "{\"target_type\": \"job\", \"target_id\": \"$TIMING_JOB\", \"thresholds\": {\"clock_skew_seconds\": 120, \"max_transit_seconds\": 300}}")
+echo "$AN_JSON"
+AN_ID=$(python3 -c "import json,sys; print(json.loads(sys.stdin.read())['id'])" <<<"$AN_JSON")
+
+# ---------------------------------------------------------------- 15. 轮询分析进度
+while :; do
+  AN=$(curl -s "$BASE/api/v1/analyses/$AN_ID")
+  STATUS=$(python3 -c "import json,sys; print(json.load(sys.stdin)['status'])" <<<"$AN")
+  echo "$AN" | python3 -c "import json,sys; j=json.load(sys.stdin); print(j['status'], j['progress'], j['phase'])"
+  if [ "$STATUS" = completed ] || [ "$STATUS" = failed ]; then break; fi
+  sleep 0.5
+done
+echo "$AN" | python3 -m json.tool   # stats.findings_by_type 汇总各类结论数
+
+# ---------------------------------------------------------------- 16. 读取时间线（可筛选）
+# 完整时间线（条目按定位时间升序，结论内联在 entries[].findings）
+curl -s "$BASE/api/v1/analyses/$AN_ID/timeline" | python3 -m json.tool
+# 按异常类型筛选（可选：client_clock_skew / abnormal_transit /
+#   hop_time_inversion / reply_before_parent / chain_mismatch）
+curl -s "$BASE/api/v1/analyses/$AN_ID/timeline?type=client_clock_skew" | python3 -m json.tool
+# 按时间区间筛选（边界必须带时区，缺时区返回 400）
+curl -s "$BASE/api/v1/analyses/$AN_ID/timeline?from=2026-09-01T09:00:00%2B00:00&to=2026-09-02T00:00:00%2B00:00" \
+  | python3 -m json.tool
+
+# ---------------------------------------------------------------- 17. 下载分析结果 JSON
+curl -s -D - "$BASE/api/v1/analyses/$AN_ID/result" -o "/tmp/${AN_ID}.analysis-result.json"
+python3 -m json.tool "/tmp/${AN_ID}.analysis-result.json" | head -40 || true
+
+# ---------------------------------------------------------------- 18. 案件级：同一 Message-ID 传输链并列展示
+CA=$(curl -s -X POST "$BASE/api/v1/jobs" -F 'file=@examples/timing-chain-a.zip;type=application/zip' | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+CB=$(curl -s -X POST "$BASE/api/v1/jobs" -F 'file=@examples/timing-chain-b.zip;type=application/zip' | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+for J in "$CA" "$CB"; do
+  while :; do
+    S=$(curl -s "$BASE/api/v1/jobs/$J" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+    [ "$S" = completed ] && break
+    [ "$S" = failed ] && { echo "作业失败: $J"; exit 1; }
+    sleep 0.5
+  done
+done
+TCASE=$(curl -s -X POST "$BASE/api/v1/cases" -H 'Content-Type: application/json' \
+  -d "{\"name\": \"传输链比对\", \"job_ids\": [\"$CA\", \"$CB\"]}" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+while :; do
+  S=$(curl -s "$BASE/api/v1/cases/$TCASE" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+  [ "$S" = completed ] && break
+  sleep 0.5
+done
+TAN=$(curl -s -X POST "$BASE/api/v1/analyses" -H 'Content-Type: application/json' \
+  -d "{\"target_type\": \"case\", \"target_id\": \"$TCASE\"}" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+while :; do
+  S=$(curl -s "$BASE/api/v1/analyses/$TAN" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+  [ "$S" = completed ] && break
+  sleep 0.5
+done
+# 两个来源的传输链在 evidence.variants 中并列展示
+curl -s "$BASE/api/v1/analyses/$TAN/timeline?type=chain_mismatch" | python3 -m json.tool
+
+# ---------------------------------------------------------------- 19. 删除源作业不影响已完成的分析
+curl -s -X DELETE "$BASE/api/v1/jobs/$CA" > /dev/null
+curl -s -X DELETE "$BASE/api/v1/jobs/$CB" > /dev/null
+curl -s "$BASE/api/v1/analyses/$TAN" | python3 -c \
+  "import json,sys; j=json.load(sys.stdin); print('分析结果仍可读:', j['status'], '结论数:', j['finding_count'])"
