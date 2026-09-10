@@ -14,6 +14,7 @@ import zipfile
 
 import tests.support  # noqa: F401
 from mailrecon import config
+from mailrecon import jsonio
 from mailrecon.server import ApiServer
 
 
@@ -314,6 +315,104 @@ class HttpApiTest(unittest.TestCase):
         )
         self.assertEqual(status, 201)
         self.assertEqual(json.loads(body)["original_filename"], "evil.zip")
+
+    def test_18_deep_chain_job_completes_and_tree_downloads(self):
+        """1100 封邮件的单链作业（超过默认递归深度 1000）。
+
+        回归 build_threads / 结果 JSON 序列化 / tree 与 result 接口在
+        深引用链上的 RecursionError。
+        """
+        depth = 1100
+        members: dict[str, bytes] = {}
+        mids = [f"<deep{i:05d}@x>" for i in range(depth)]
+
+        def eml(i: int) -> bytes:
+            lines = [
+                f"Message-ID: {mids[i]}",
+                "From: A <a@x>",
+                "To: B <b@x>",
+                f"Subject: deep chain {i}",
+                f"Date: Mon, 01 Sep 2026 09:{i % 60:02d}:00 +0000",
+            ]
+            if i > 0:
+                lines.append(f"In-Reply-To: {mids[i - 1]}")
+                lines.append(f"References: {mids[i - 1]}")
+            lines.append("")
+            lines.append(f"body {i}")
+            return ("\r\n".join(lines)).encode("utf-8")
+
+        # 逆序放入压缩包，强制解析时沿引用链一路下探
+        for i in range(depth - 1, -1, -1):
+            members[f"mails/{i:05d}.eml"] = eml(i)
+
+        zip_bytes = make_zip_bytes(members)
+        status, _, body = self.client.create_job(
+            zip_bytes, filename="deep.zip",
+            idem="deep-" + uuid.uuid4().hex,
+        )
+        self.assertEqual(status, 201, body)
+        job = json.loads(body)
+
+        done = self.client.wait_for(job["id"], timeout=30)
+        self.assertEqual(done["status"], config.STATUS_COMPLETED, done)
+        self.assertEqual(done["email_count"], depth)
+        self.assertEqual(done["thread_count"], 1)
+        self.assertEqual(
+            done["stats"]["issues_by_type"]["reference_cycle"], 0
+        )
+        self.assertEqual(
+            done["stats"]["issues_by_type"]["missing_parent"], 0
+        )
+
+        # /tree：沿 children 迭代（测试自身也不递归）走完整条链
+        status, headers, body = self.client.request(
+            "GET", f"/api/v1/jobs/{job['id']}/tree"
+        )
+        self.assertEqual(status, 200)
+        tree = jsonio.loads(body)
+        self.assertEqual(len(tree["threads"]), 1)
+        current = tree["threads"][0]
+        count = 0
+        while True:
+            count += 1
+            if current["children"]:
+                self.assertEqual(len(current["children"]), 1)
+                current = current["children"][0]
+            else:
+                break
+        self.assertEqual(count, depth)
+        self.assertEqual(current["message_id"], mids[-1])
+        self.assertIn(f"body {depth - 1}", current["body_text"])
+
+        # compact 视图同样可用
+        status, _, body = self.client.request(
+            "GET", f"/api/v1/jobs/{job['id']}/tree?view=compact"
+        )
+        self.assertEqual(status, 200)
+        compact = jsonio.loads(body)
+        current = compact["threads"][0]
+        count = 0
+        while current["children"]:
+            self.assertEqual(len(current["children"]), 1)
+            current = current["children"][0]
+            count += 1
+        self.assertEqual(count, depth - 1)
+
+        # /result：下载 JSON 附件并可解析
+        status, headers, body = self.client.request(
+            "GET", f"/api/v1/jobs/{job['id']}/result"
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("attachment", headers.get("Content-Disposition", ""))
+        result = jsonio.loads(body)
+        self.assertEqual(result["job_id"], job["id"])
+        self.assertEqual(result["stats"]["eml_parsed"], depth)
+        current = result["threads"][0]
+        count = 0
+        while current["children"]:
+            current = current["children"][0]
+            count += 1
+        self.assertEqual(count, depth - 1)
 
 
 class UploadLimitTest(unittest.TestCase):

@@ -3,22 +3,45 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 import threading
 import uuid
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from . import config
+from . import config, jsonio
 from .processor import JobProcessor
 from .storage import Storage
 
 _JOB_ID_RE = re.compile(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")
 _IDEMPOTENCY_RE = re.compile(r"^[\x21-\x7E]{8,200}$")
+
+# 超过该嵌套深度的响应放弃缩进，改用紧凑 JSON（避免 O(深度²) 输出）
+_PRETTY_MAX_DEPTH = 500
+
+
+def _json_depth(value: Any) -> int:
+    """迭代计算 dict/list 的最大嵌套深度（dict/list 各算一层）。"""
+    max_depth = 0
+    # (当前容器, 已展开标记)；用栈模拟递归
+    stack: list[Any] = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        if isinstance(item, dict):
+            depth += 1
+            max_depth = max(max_depth, depth)
+            for v in item.values():
+                if isinstance(v, (dict, list)):
+                    stack.append((v, depth))
+        elif isinstance(item, list):
+            depth += 1
+            max_depth = max(max_depth, depth)
+            for v in item:
+                if isinstance(v, (dict, list)):
+                    stack.append((v, depth))
+    return max_depth
 
 
 class ApiError(Exception):
@@ -97,7 +120,12 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------ 响应工具
 
     def _json(self, status: int, payload: Any) -> None:
-        data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        # 深嵌套（典型为超长引用链）时，缩进 JSON 的闭合括号缩进会产生
+        # O(深度²) 体积，超过阈值自动降级为紧凑输出。
+        indent = 2 if _json_depth(payload) <= _PRETTY_MAX_DEPTH else None
+        data = jsonio.dumps(payload, ensure_ascii=False, indent=indent).encode(
+            "utf-8"
+        )
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
@@ -239,7 +267,7 @@ class Handler(BaseHTTPRequestHandler):
                 "not_ready",
                 f"作业尚未完成 (当前状态: {job['status']})",
             )
-        result = json.loads(Path(job["result_path"]).read_text("utf-8"))
+        result = jsonio.loads(Path(job["result_path"]).read_text("utf-8"))
         payload: dict[str, Any] = {
             "job_id": job["id"],
             "stats": result["stats"],
@@ -247,9 +275,7 @@ class Handler(BaseHTTPRequestHandler):
             "threads": result["threads"],
         }
         if query.get("view") == ["compact"]:
-            payload["threads"] = [
-                _compact_tree(n) for n in result["threads"]
-            ]
+            payload["threads"] = _compact_forest(result["threads"])
         self._json(200, payload)
 
     def _get_result(self, job_id: str) -> None:
@@ -358,7 +384,27 @@ class Handler(BaseHTTPRequestHandler):
         self._json(201, self._public_job(job))
 
 
-def _compact_tree(node: dict[str, Any]) -> dict[str, Any]:
+def _compact_forest(roots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """迭代式生成紧凑树视图，不受递归深度限制，children 保持原顺序。"""
+    compact_roots: list[dict[str, Any]] = []
+    for source_root in roots:
+        target_root = _compact_node(source_root)
+        compact_roots.append(target_root)
+        # (源节点, 目标父节点)；逆序压栈以保持 children 顺序
+        stack: list[tuple[dict[str, Any], dict[str, Any]]] = [
+            (child, target_root)
+            for child in reversed(source_root["children"])
+        ]
+        while stack:
+            source, target_parent = stack.pop()
+            target = _compact_node(source)
+            target_parent["children"].append(target)
+            for child in reversed(source["children"]):
+                stack.append((child, target))
+    return compact_roots
+
+
+def _compact_node(node: dict[str, Any]) -> dict[str, Any]:
     return {
         "uid": node["uid"],
         "source_file": node["source_file"],
@@ -368,7 +414,7 @@ def _compact_tree(node: dict[str, Any]) -> dict[str, Any]:
         "subject": node["subject"],
         "issue_count": len(node["issues"]),
         "attachment_count": len(node["attachments"]),
-        "children": [_compact_tree(c) for c in node["children"]],
+        "children": [],
     }
 
 

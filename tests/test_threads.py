@@ -189,6 +189,65 @@ class ThreadsTest(unittest.TestCase):
             walk(root, set())
         self.assertEqual(len(seen), 5)
 
+    def test_deep_chain_beyond_recursion_limit(self):
+        """1200 封邮件单链（> 默认递归深度 1000），必须建成一条直链。"""
+        depth = 1200
+        mids = [f"<m{i:05d}@x>" for i in range(depth)]
+        records = [rec("00000.eml", mids[0])]
+        for i in range(1, depth):
+            records.append(
+                rec(
+                    f"{i:05d}.eml",
+                    mids[i],
+                    irt=mids[i - 1],
+                    refs=[mids[i - 1]],
+                )
+            )
+        tree = threads.build_threads(records)
+
+        # 只有一个根，且沿 children 一直走到底，深度 = depth
+        self.assertEqual(len(tree["roots"]), 1)
+        current = tree["roots"][0]
+        seen = 0
+        while True:
+            seen += 1
+            if current["children"]:
+                self.assertEqual(len(current["children"]), 1)
+                current = current["children"][0]
+            else:
+                break
+        self.assertEqual(seen, depth)
+        self.assertEqual(current["message_id"], mids[-1])
+        # 没有任何异常标注
+        self.assertEqual(tree["issues_summary"]["reference_cycle"], 0)
+        self.assertEqual(tree["issues_summary"]["missing_parent"], 0)
+
+    def test_deep_chain_shuffled_input_order(self):
+        """乱序输入的深链同样能还原成一条链。"""
+        depth = 1200
+        mids = [f"<s{i:05d}@x>" for i in range(depth)]
+        records = [
+            rec(
+                f"{i:05d}.eml",
+                mids[i],
+                irt=mids[i - 1] if i else None,
+                refs=[mids[i - 1]] if i else [],
+            )
+            for i in range(depth)
+        ]
+        # 逆序输入（子在父之前），这正是递归解析会一路下探的情形
+        records = list(reversed(records))
+        tree = threads.build_threads(records)
+        self.assertEqual(len(tree["roots"]), 1)
+        current = tree["roots"][0]
+        seen = 0
+        while current["children"]:
+            self.assertEqual(len(current["children"]), 1)
+            current = current["children"][0]
+            seen += 1
+        self.assertEqual(seen, depth - 1)
+        self.assertEqual(tree["roots"][0]["message_id"], mids[0])
+
 
 if __name__ == "__main__":
     unittest.main()

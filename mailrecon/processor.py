@@ -2,14 +2,43 @@
 
 from __future__ import annotations
 
-import json
 import threading
 import traceback
 from pathlib import Path
 from typing import Any
 
-from . import config, mailparser, threads, zipguard
+from . import config, jsonio, mailparser, threads, zipguard
 from .storage import Storage, utc_now
+
+_PUBLIC_FIELDS = (
+    "uid", "source_file", "raw_sha256", "message_id", "in_reply_to",
+    "references", "date", "from", "to", "cc", "subject", "body_text",
+    "body_html_present", "attachments", "issues",
+)
+
+
+def _public_forest(roots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """迭代式深拷贝出对外的节点树（剥掉内部字段），不受递归深度限制。"""
+    public_roots: list[dict[str, Any]] = []
+    for source_root in roots:
+        target_root = _public_node(source_root)
+        public_roots.append(target_root)
+        # DFS：(源节点, 目标父节点)，逆序压栈以保持 children 原顺序
+        stack: list[tuple[dict[str, Any], dict[str, Any]]] = [
+            (child, target_root)
+            for child in reversed(source_root["children"])
+        ]
+        while stack:
+            source, target_parent = stack.pop()
+            target = _public_node(source)
+            target_parent["children"].append(target)
+            for child in reversed(source["children"]):
+                stack.append((child, target))
+    return public_roots
+
+
+def _public_node(node: dict[str, Any]) -> dict[str, Any]:
+    return {field: node[field] for field in _PUBLIC_FIELDS} | {"children": []}
 
 
 class JobProcessor:
@@ -113,9 +142,10 @@ class JobProcessor:
 
         result_path = job_dir / "result.json"
         tmp_path = job_dir / "result.json.tmp"
-        tmp_path.write_text(
-            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        # 紧凑序列化：缩进格式在纯引用链上会产生 O(深度²) 的闭合缩进，
+        # 万级深链时体积爆炸；紧凑 JSON 为线性大小，仍可被任意工具解析。
+        with tmp_path.open("w", encoding="utf-8") as fp:
+            jsonio.dump(result, fp, ensure_ascii=False, indent=None)
         tmp_path.replace(result_path)
 
         # ---- 5. 删除解压目录（原始 upload.bin 保留，结果只在 JSON）
@@ -138,27 +168,7 @@ class JobProcessor:
         skipped: list[dict[str, str]],
         total_entries: int,
     ) -> dict[str, Any]:
-        def public_node(node: dict[str, Any]) -> dict[str, Any]:
-            return {
-                "uid": node["uid"],
-                "source_file": node["source_file"],
-                "raw_sha256": node["raw_sha256"],
-                "message_id": node["message_id"],
-                "in_reply_to": node["in_reply_to"],
-                "references": node["references"],
-                "date": node["date"],
-                "from": node["from"],
-                "to": node["to"],
-                "cc": node["cc"],
-                "subject": node["subject"],
-                "body_text": node["body_text"],
-                "body_html_present": node["body_html_present"],
-                "attachments": node["attachments"],
-                "issues": node["issues"],
-                "children": [public_node(c) for c in node["children"]],
-            }
-
-        roots = [public_node(n) for n in tree["roots"]]
+        roots = _public_forest(tree["roots"])
 
         # 统计
         total_issues = 0
