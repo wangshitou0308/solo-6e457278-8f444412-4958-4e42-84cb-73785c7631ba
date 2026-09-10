@@ -25,7 +25,7 @@ mailrecon/            服务源码
 scripts/
   make_sample.py      生成正常示例包 examples/sample-mails.zip
   make_evil.py        生成应被拒绝的恶意/超限 ZIP
-tests/                51 个 unittest 用例
+tests/                65 个 unittest 用例
 examples/             生成产物（正常包 + evil/ 恶意包）
 docs/API.md           接口文档
 docs/API_EXAMPLES.sh  curl 调用示例
@@ -106,7 +106,7 @@ DATA_DIR/jobs/<job_id>/extract/    处理期间临时解压目录，完成后立
 ## 测试
 
 ```bash
-python3 -m unittest discover -s tests -v     # 51 个用例
+python3 -m unittest discover -s tests -v     # 65 个用例
 ```
 
 ## 更多

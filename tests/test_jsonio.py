@@ -130,14 +130,59 @@ class DeepNestingTest(unittest.TestCase):
         self.assertEqual(count, depth)
         self.assertEqual(current["v"], 1)
 
-    def test_standard_json_would_recurse(self):
-        """防御性断言：标准库在该深度确实会 RecursionError，证明测试有效。"""
-        root = self._deep(1100)
+    def test_independent_of_recursion_limit(self):
+        """深链读写不受 Python 递归深度限制（跨 Python 版本稳定）。
+
+        不能写死“标准库在 1100 层必抛 RecursionError”：不同 Python
+        版本（如 3.12）的 json C 实现对嵌套的容忍度不同，该假设不成立。
+
+        改为在测试内把 ``sys.recursionlimit`` 主动降到一个确定很浅的
+        值，并用一个朴素递归遍历器作为“深度确实超过递归预算”的稳定
+        基准：同一份深数据上，递归遍历必然 RecursionError，而 jsonio
+        的序列化与解析（显式栈、不使用 Python 递归）照常成功。
+        """
+        import sys
+
+        depth = 600  # 远超下面设置的浅递归预算
+        root = self._deep(depth)
+
+        def recurse_depth(node) -> int:
+            # 朴素递归：每层增加真实 Python 调用帧
+            children = node["children"]
+            if not children:
+                return 0
+            return 1 + recurse_depth(children[0])
+
+        original_limit = sys.getrecursionlimit()
+        self.addCleanup(sys.setrecursionlimit, original_limit)
+        # 降到很低：相对测试方法当前调用栈只留少量预算，足以证明
+        # 递归路径会被切断，而迭代实现完全不受影响。
+        sys.setrecursionlimit(120)
+
+        # 前置条件：这个深度在浅预算下，朴素递归确实失败 —— 保证测试
+        # 本身确实在“超过递归深度”的条件下运行，而不是侥幸通过。
         with self.assertRaises(RecursionError):
-            stdjson.dumps(root, indent=2)
-        text = jsonio.dumps(root)
-        with self.assertRaises(RecursionError):
-            stdjson.loads(text)
+            recurse_depth(root)
+
+        # 核心断言：jsonio 写入与读取同一份深数据均成功
+        text = jsonio.dumps(root, ensure_ascii=False, indent=2)
+        obj = jsonio.loads(text)
+        current = obj
+        count = 0
+        while current["children"]:
+            current = current["children"][0]
+            count += 1
+        self.assertEqual(count, depth)
+        self.assertEqual(current["v"], 1)
+
+        # 同样在浅递归预算下，jsonio 紧凑往返也成功
+        again = jsonio.loads(jsonio.dumps(obj, ensure_ascii=False))
+        current = again
+        count = 0
+        while current["children"]:
+            current = current["children"][0]
+            count += 1
+        self.assertEqual(count, depth)
 
 
 if __name__ == "__main__":
