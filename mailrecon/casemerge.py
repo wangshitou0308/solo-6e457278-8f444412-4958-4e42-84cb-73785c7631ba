@@ -30,11 +30,23 @@ _RESOLVED = 2
 # canonical 表中的歧义标记：Message-ID 对应多封内容不同的邮件
 _AMBIGUOUS = -1
 
+
+def _empty_identity() -> dict[str, Any]:
+    return {
+        "from": [],
+        "sender": [],
+        "reply_to": [],
+        "return_path": [],
+        "message_id": {"present": False, "headers": []},
+        "dkim": [],
+        "anomalies": [],
+    }
+
 # 从来源节点原样拷贝的内容字段（同一 SHA-256 的字节相同，解析结果一致）
 _CONTENT_FIELDS = (
     "message_id", "raw_sha256", "in_reply_to", "references", "date",
     "from", "to", "cc", "subject", "body_text", "body_html_present",
-    "attachments", "received",
+    "attachments", "received", "identity",
 )
 
 
@@ -211,8 +223,9 @@ def _new_merged_node(
     uid: int, job_id: str, src: dict[str, Any]
 ) -> dict[str, Any]:
     node = {field: src[field] for field in _CONTENT_FIELDS if field in src}
-    # 旧版本作业结果没有 received 字段，按空链处理（不猜测）
+    # 旧版本作业结果没有 received/identity 字段，按空结构处理（不猜测）
     node.setdefault("received", [])
+    node.setdefault("identity", _empty_identity())
     node["uid"] = uid
     node["sources"] = [_source_entry(job_id, src)]
     # 原始问题保留来源作业中的原文（同一 SHA-256 解析结果一致，

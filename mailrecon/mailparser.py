@@ -15,6 +15,7 @@ from email.policy import default
 from email.utils import getaddresses, parsedate_to_datetime
 from typing import Any
 
+from .idheaders import parse_identity_headers
 from .received import parse_received_headers
 
 # 从裸文本里提取 <msg-id@host> 形态标识
@@ -34,6 +35,11 @@ def parse_eml(raw: bytes, source_name: str) -> dict[str, Any]:
     try:
         msg = email.message_from_bytes(raw, policy=default)
     except Exception as exc:  # 极端畸形结构
+        # 即便 MIME 结构无法按默认策略解析，仍尽力用宽松策略保留身份头
+        try:
+            identity = parse_identity_headers(email.message_from_bytes(raw))
+        except Exception:
+            identity = _empty_identity()
         return {
             "source_file": source_name,
             "raw_sha256": raw_sha,
@@ -49,6 +55,7 @@ def parse_eml(raw: bytes, source_name: str) -> dict[str, Any]:
             "body_html_present": False,
             "attachments": [],
             "received": [],
+            "identity": identity,
             "issues": [f"MIME 结构无法解析: {type(exc).__name__}: {exc}"],
         }
 
@@ -86,6 +93,10 @@ def parse_eml(raw: bytes, source_name: str) -> dict[str, Any]:
     # issues，不阻断解析
     received = parse_received_headers(msg.get_all("Received", []))
 
+    # 声明身份头（From/Sender/Reply-To/Return-Path/Message-ID/DKIM-Signature）：
+    # 保留重复头与原始值，只提取地址/域名与 d/s/i/h 标签，不核验真伪
+    identity = parse_identity_headers(msg)
+
     return {
         "source_file": source_name,
         "raw_sha256": raw_sha,
@@ -101,7 +112,20 @@ def parse_eml(raw: bytes, source_name: str) -> dict[str, Any]:
         "body_html_present": html_present,
         "attachments": attachments,
         "received": received,
+        "identity": identity,
         "issues": issues,
+    }
+
+
+def _empty_identity() -> dict[str, Any]:
+    return {
+        "from": [],
+        "sender": [],
+        "reply_to": [],
+        "return_path": [],
+        "message_id": {"present": False, "headers": []},
+        "dkim": [],
+        "anomalies": [],
     }
 
 

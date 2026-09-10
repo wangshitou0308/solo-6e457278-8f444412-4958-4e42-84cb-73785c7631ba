@@ -12,6 +12,10 @@
   落盘结果文件统一使用紧凑 JSON。
 - 时序核验：每封邮件的全部 `Received` 头按原顺序解析保留（见第 4 节
   节点字段），可对已完成的作业/案件创建后台时序核验分析（第 12–15 节）。
+- 声明身份核验：每个节点新增 `identity` 头块（见第 4 节），可对已完成的
+  作业/案件创建后台声明身份核验（第 16–19 节）。**离线运行：不查 DNS、
+  不验证 DKIM 签名真伪**，只客观记录声明差异与待复核证据，证据不足时
+  标注无法核验，绝不直接判定伪造。
 
 ## 1. 创建作业
 
@@ -159,6 +163,52 @@ GET /api/v1/jobs/{job_id}/tree?view=compact
           "issues": []
         }
       ],
+      "identity": {
+        "from": [
+          {
+            "index": 0,
+            "raw": "李雷 <lilei@example.com>",
+            "count": 1,
+            "addresses": [ { "name": "李雷", "address": "lilei@example.com", "domain": "example.com" } ],
+            "address": "lilei@example.com",
+            "name": "李雷",
+            "domain": "example.com",
+            "anomalies": []
+          }
+        ],
+        "sender": [],
+        "reply_to": [],
+        "return_path": [],
+        "message_id": {
+          "present": true,
+          "headers": [
+            {
+              "index": 0,
+              "raw": "<...@example.com>",
+              "value": "<...@example.com>",
+              "local_part": "...",
+              "domain": "example.com",
+              "anomalies": []
+            }
+          ]
+        },
+        "dkim": [
+          {
+            "index": 0,
+            "raw": "v=1; d=example.com; s=sel; h=From:To; b=...",
+            "present": true,
+            "d": "example.com",
+            "s": "sel",
+            "i": null,
+            "i_local_part": null,
+            "i_domain": null,
+            "h": ["from", "to"],
+            "covers_from": true,
+            "anomalies": []
+          }
+        ],
+        "anomalies": []
+      },
       "issues": [],
       "children": [ { } ]
     }

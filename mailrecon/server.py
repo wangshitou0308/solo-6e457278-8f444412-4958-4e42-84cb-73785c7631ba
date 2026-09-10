@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from . import config, jsonio, timing
+from . import config, identity, jsonio, timing
 from .caseproc import CaseProcessor
+from .identityproc import IdentityProcessor
 from .processor import JobProcessor
 from .storage import Storage
 from .timeproc import TimingProcessor
@@ -112,6 +113,7 @@ class Handler(BaseHTTPRequestHandler):
     processor: JobProcessor
     case_processor: CaseProcessor
     timing_processor: TimingProcessor
+    identity_processor: IdentityProcessor
     create_lock: threading.Lock
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -179,7 +181,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/") or "/"
-            query = parse_qs(parsed.query)
+            query = parse_qs(parsed.query, keep_blank_values=True)
 
             if path == "/health":
                 self._json(200, {"status": "ok", "version": "1.0.0"})
@@ -187,6 +189,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._list_jobs()
             elif path == "/api/v1/analyses":
                 self._list_analyses()
+            elif path == "/api/v1/identity-checks":
+                self._list_identity_checks()
             else:
                 match = re.fullmatch(r"/api/v1/jobs/([^/]+)", path)
                 if match:
@@ -228,6 +232,36 @@ class Handler(BaseHTTPRequestHandler):
                 if match:
                     self._get_analysis_result(match.group(1))
                     return
+                match = re.fullmatch(
+                    r"/api/v1/identity-checks/([^/]+)", path
+                )
+                if match:
+                    self._get_identity_check(match.group(1))
+                    return
+                match = re.fullmatch(
+                    r"/api/v1/identity-checks/([^/]+)/findings", path
+                )
+                if match:
+                    self._get_identity_findings(match.group(1), query)
+                    return
+                match = re.fullmatch(
+                    r"/api/v1/identity-checks/([^/]+)/emails", path
+                )
+                if match:
+                    self._get_identity_emails(match.group(1), query)
+                    return
+                match = re.fullmatch(
+                    r"/api/v1/identity-checks/([^/]+)/threads", path
+                )
+                if match:
+                    self._get_identity_threads(match.group(1), query)
+                    return
+                match = re.fullmatch(
+                    r"/api/v1/identity-checks/([^/]+)/result", path
+                )
+                if match:
+                    self._get_identity_result(match.group(1))
+                    return
                 self._error(404, "not_found", f"未知路径: {self.path}")
         except ApiError as exc:
             self._error(exc.status, exc.code, exc.message)
@@ -244,6 +278,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._create_case()
             elif path == "/api/v1/analyses":
                 self._create_analysis()
+            elif path == "/api/v1/identity-checks":
+                self._create_identity_check()
             else:
                 self._error(404, "not_found", f"未知路径: {self.path}")
         except ApiError as exc:
@@ -747,6 +783,369 @@ class Handler(BaseHTTPRequestHandler):
         download_name = f"{analysis['id']}.analysis-result.json"
         self._file_download(Path(analysis["result_path"]), download_name)
 
+    # ------------------------------------------------- 声明身份核验端点
+
+    def _public_identity_check(self, check: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": check["id"],
+            "status": check["status"],
+            "created_at": check["created_at"],
+            "updated_at": check["updated_at"],
+            "target_type": check["target_type"],
+            "target_id": check["target_id"],
+            "progress": check["progress"],
+            "phase": check["phase"],
+            "error": check["error"],
+            "email_count": check["email_count"],
+            "finding_count": check["finding_count"],
+            "review_count": check["review_count"],
+            "stats": check["stats"],
+        }
+
+    def _require_identity_check(self, check_id: str) -> dict[str, Any]:
+        if not _UUID_RE.fullmatch(check_id):
+            raise ApiError(400, "bad_request", "核验 ID 格式非法")
+        check = self.storage.get_identity_check(check_id)
+        if check is None:
+            raise ApiError(404, "not_found", f"核验不存在: {check_id}")
+        return check
+
+    def _list_identity_checks(self) -> None:
+        checks = self.storage.list_identity_checks()
+        self._json(
+            200, {"identity_checks": [self._public_identity_check(c) for c in checks]}
+        )
+
+    def _create_identity_check(self) -> None:
+        content_type = self.headers.get("Content-Type", "")
+        if content_type.lower().split(";")[0].strip() != "application/json":
+            raise ApiError(
+                415,
+                "unsupported_media_type",
+                "创建声明身份核验请使用 application/json 请求体",
+            )
+        body = self._read_body_capped()
+        if not body:
+            raise ApiError(400, "bad_request", "请求体为空")
+        try:
+            payload = jsonio.loads(body)
+        except Exception:
+            raise ApiError(400, "bad_request", "请求体不是合法 JSON")
+        if not isinstance(payload, dict):
+            raise ApiError(400, "bad_request", "请求体必须是 JSON 对象")
+
+        target_type = payload.get("target_type")
+        if target_type not in ("job", "case"):
+            raise ApiError(
+                400, "bad_request", "target_type 必须是 \"job\" 或 \"case\""
+            )
+        target_id = payload.get("target_id")
+        if not isinstance(target_id, str) or not _UUID_RE.fullmatch(target_id):
+            raise ApiError(400, "bad_request", "target_id 必须是作业/案件 UUID")
+        unknown = set(payload) - {"target_type", "target_id"}
+        if unknown:
+            raise ApiError(
+                400,
+                "bad_request",
+                "未知请求字段: " + ", ".join(sorted(unknown)),
+            )
+
+        with self.create_lock:
+            if target_type == "job":
+                target = self.storage.get_job(target_id)
+                label = "作业"
+            else:
+                target = self.storage.get_case(target_id)
+                label = "案件"
+            if target is None:
+                raise ApiError(
+                    404,
+                    "target_not_found",
+                    f"目标{label}不存在或已被删除: {target_id}",
+                )
+            if target["status"] != config.STATUS_COMPLETED:
+                raise ApiError(
+                    409,
+                    "target_not_completed",
+                    f"目标{label}未完成，不能创建声明身份核验: {target_id} "
+                    f"(当前状态: {target['status']})",
+                )
+            check_id = str(uuid.uuid4())
+            Storage.prepare_identity_check_dir(check_id)
+            self.storage.create_identity_check(check_id, target_type, target_id)
+
+        self.identity_processor.enqueue(check_id)
+        check = self.storage.get_identity_check(check_id)
+        self._json(201, self._public_identity_check(check))
+
+    def _get_identity_check(self, check_id: str) -> None:
+        self._json(200, self._public_identity_check(self._require_identity_check(check_id)))
+
+    def _completed_identity_result(
+        self, check_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        check = self._require_identity_check(check_id)
+        if check["status"] != config.STATUS_COMPLETED or not check["result_path"]:
+            raise ApiError(
+                409,
+                "not_ready",
+                f"核验尚未完成 (当前状态: {check['status']})",
+            )
+        result = jsonio.loads(Path(check["result_path"]).read_text("utf-8"))
+        return check, result
+
+    def _identity_filters(
+        self, query: dict[str, list[str]]
+    ) -> tuple[str | None, str | None, str | None]:
+        """解析 ?type=&status=&domain= 筛选参数，非法值明确拒绝。"""
+        raw_type = query.get("type", [None])[0]
+        if raw_type is not None and raw_type not in identity.FINDING_TYPES:
+            raise ApiError(
+                400,
+                "bad_request",
+                f"未知发现类型: {raw_type!r}，可选: "
+                + ", ".join(identity.FINDING_TYPES),
+            )
+        raw_status = query.get("status", [None])[0]
+        if raw_status is not None and raw_status not in (
+            "observed",
+            "needs_review",
+            "inconclusive",
+        ):
+            raise ApiError(
+                400,
+                "bad_request",
+                "status 须为 observed / needs_review / inconclusive",
+            )
+        raw_domain = query.get("domain", [None])[0]
+        if "domain" in query and (raw_domain is None or not raw_domain.strip()):
+            raise ApiError(
+                400, "bad_request", "domain 筛选参数不能为空（须为域名）"
+            )
+        if raw_domain is not None:
+            raw_domain = raw_domain.strip().lower()
+            if len(raw_domain) > 253 or any(ch.isspace() for ch in raw_domain):
+                raise ApiError(
+                    400, "bad_request", "domain 筛选参数非法（须为域名）"
+                )
+        return raw_type, raw_status, raw_domain
+
+    @staticmethod
+    def _finding_domains(finding: dict[str, Any]) -> list[str]:
+        """收集一条发现涉及的全部域（小写去重保序），供 domain 筛选。"""
+        domains: list[str] = []
+
+        def add(value: Any) -> None:
+            if isinstance(value, str) and value:
+                low = value.lower()
+                if low not in domains:
+                    domains.append(low)
+
+        evidence = finding.get("evidence") or {}
+        add(evidence.get("from_domain"))
+        add(evidence.get("message_id_domain"))
+        add(evidence.get("from", {}).get("domain") if isinstance(
+            evidence.get("from"), dict
+        ) else None)
+        for cell in evidence.get("comparisons", []) or []:
+            add(cell.get("domain"))
+        for dom in evidence.get("domains", []) or []:
+            add(dom)
+        for sig in evidence.get("signatures", []) or []:
+            add(sig.get("d"))
+            add(sig.get("i_domain"))
+        for item in evidence.get("emails", []) or []:
+            add(item.get("message_id_domain"))
+        for key in ("reply", "parent"):
+            val = evidence.get(key)
+            if isinstance(val, dict):
+                add(val.get("domain"))
+        for dom in evidence.get("ancestor_domains", []) or []:
+            add(dom)
+        return domains
+
+    def _match_finding(
+        self,
+        finding: dict[str, Any],
+        ftype: str | None,
+        fstatus: str | None,
+        domain: str | None,
+    ) -> bool:
+        if ftype is not None and finding["type"] != ftype:
+            return False
+        if fstatus is not None and finding["status"] != fstatus:
+            return False
+        if domain is not None:
+            domains = self._finding_domains(finding)
+            if not any(d == domain or d.endswith("." + domain) for d in domains):
+                return False
+        return True
+
+    def _get_identity_findings(
+        self, check_id: str, query: dict[str, list[str]]
+    ) -> None:
+        check, result = self._completed_identity_result(check_id)
+        ftype, fstatus, domain = self._identity_filters(query)
+        findings = [
+            f
+            for f in result["findings"]
+            if self._match_finding(f, ftype, fstatus, domain)
+        ]
+        flags = result.get("review_flags", [])
+        if domain is not None:
+            flags = [
+                f
+                for f in flags
+                if self._review_flag_mentions_domain(f, domain)
+            ]
+        self._json(
+            200,
+            {
+                "identity_check_id": check_id,
+                "target_type": check["target_type"],
+                "target_id": check["target_id"],
+                "filters": {"type": ftype, "status": fstatus, "domain": domain},
+                "finding_count": len(findings),
+                "findings": findings,
+                "review_flag_count": len(flags),
+                "review_flags": flags,
+            },
+        )
+
+    @staticmethod
+    def _review_flag_mentions_domain(flag: dict[str, Any], domain: str) -> bool:
+        """待复核证据的域匹配（宽松：证据 JSON 中出现该域字符串即可）。"""
+        evidence = flag.get("evidence") or {}
+        blob = jsonio.dumps(evidence, ensure_ascii=False).lower()
+        return domain in blob
+
+    def _get_identity_emails(
+        self, check_id: str, query: dict[str, list[str]]
+    ) -> None:
+        check, result = self._completed_identity_result(check_id)
+        ftype, fstatus, domain = self._identity_filters(query)
+        # 邮件级检查类型（checks 中可用的键）
+        email_level_types = (
+            "from_domain_mismatch",
+            "message_id_domain_drift",
+            "dkim_from_not_covered",
+        )
+        if ftype is not None and ftype not in email_level_types:
+            raise ApiError(
+                400,
+                "bad_request",
+                "邮件汇总接口的 type 须为 "
+                + " / ".join(email_level_types),
+            )
+        reports = result.get("email_reports", [])
+        out = []
+        for report in reports:
+            checks = report.get("checks", {})
+
+            def is_finding_cell(cell: dict[str, Any] | None) -> bool:
+                """检查单元是否对应一条实际差异发现（不含无法核验）。
+
+                无法核验（inconclusive）通过 ``status=inconclusive`` 单独
+                筛选；类型筛选只返回真正观察到差异/待复核的邮件。
+                """
+                if not cell or cell.get("status") is None:
+                    return False
+                if cell.get("status") == "needs_review":
+                    return True
+                # observed：只有明确差异（match is False）才算发现
+                return (
+                    cell.get("status") == "observed"
+                    and cell.get("match") is False
+                )
+
+            if ftype is not None:
+                if not is_finding_cell(checks.get(ftype)):
+                    continue
+            if fstatus is not None:
+                cells = checks.values()
+                if not any(
+                    c.get("status") == fstatus
+                    and (is_finding_cell(c) if fstatus == "observed" else True)
+                    for c in cells
+                ):
+                    continue
+            if domain is not None:
+                mentioned = {
+                    str(report.get("from_domain") or "").lower(),
+                    str(report.get("message_id_domain") or "").lower(),
+                }
+                mentioned.update(
+                    str(d or "").lower()
+                    for d in (report.get("sender_domains") or [])
+                    + (report.get("return_path_domains") or [])
+                    + (report.get("reply_to_domains") or [])
+                )
+                mentioned.update(
+                    str(dkim.get("d") or "").lower()
+                    for dkim in report.get("dkim", [])
+                )
+                mentioned.update(
+                    str(dkim.get("i_domain") or "").lower()
+                    for dkim in report.get("dkim", [])
+                )
+                if not any(
+                    d and (d == domain or d.endswith("." + domain))
+                    for d in mentioned
+                ):
+                    continue
+            out.append(report)
+        self._json(
+            200,
+            {
+                "identity_check_id": check_id,
+                "filters": {"type": ftype, "status": fstatus, "domain": domain},
+                "email_count": len(out),
+                "emails": out,
+            },
+        )
+
+    def _get_identity_threads(
+        self, check_id: str, query: dict[str, list[str]]
+    ) -> None:
+        check, result = self._completed_identity_result(check_id)
+        ftype, _, domain = self._identity_filters(query)
+        findings_by_id = {f["id"]: f for f in result["findings"]}
+        reports = result.get("thread_reports", [])
+        out = []
+        for report in reports:
+            related = [
+                findings_by_id[fid]
+                for fid in report.get("finding_ids", [])
+                if fid in findings_by_id
+            ]
+            if ftype is not None:
+                related = [f for f in related if f["type"] == ftype]
+                if not related:
+                    continue
+            if domain is not None:
+                related = [
+                    f
+                    for f in related
+                    if self._match_finding(f, None, None, domain)
+                ]
+                if not related:
+                    continue
+            out.append({**report, "findings": related})
+        self._json(
+            200,
+            {
+                "identity_check_id": check_id,
+                "filters": {"type": ftype, "domain": domain},
+                "thread_count": len(out),
+                "threads": out,
+            },
+        )
+
+    def _get_identity_result(self, check_id: str) -> None:
+        check, _ = self._completed_identity_result(check_id)
+        download_name = f"{check['id']}.identity-result.json"
+        self._file_download(Path(check["result_path"]), download_name)
+
 
 def _compact_forest(
     roots: list[dict[str, Any]],
@@ -888,12 +1287,14 @@ class ApiServer(ThreadingHTTPServer):
         self.processor = JobProcessor(self.storage)
         self.case_processor = CaseProcessor(self.storage)
         self.timing_processor = TimingProcessor(self.storage)
+        self.identity_processor = IdentityProcessor(self.storage)
         self.create_lock = threading.Lock()
         # 注入给 Handler 实例使用
         Handler.storage = self.storage
         Handler.processor = self.processor
         Handler.case_processor = self.case_processor
         Handler.timing_processor = self.timing_processor
+        Handler.identity_processor = self.identity_processor
         Handler.create_lock = self.create_lock
 
     def start(self) -> None:
@@ -901,11 +1302,13 @@ class ApiServer(ThreadingHTTPServer):
         self.processor.start()
         self.case_processor.start()
         self.timing_processor.start()
+        self.identity_processor.start()
 
     def serve(self) -> None:
         self.processor.start()
         self.case_processor.start()
         self.timing_processor.start()
+        self.identity_processor.start()
         try:
             self.serve_forever()
         finally:

@@ -25,6 +25,18 @@ _RESOLVING = 1
 _RESOLVED = 2
 
 
+def _empty_identity() -> dict[str, Any]:
+    return {
+        "from": [],
+        "sender": [],
+        "reply_to": [],
+        "return_path": [],
+        "message_id": {"present": False, "headers": []},
+        "dkim": [],
+        "anomalies": [],
+    }
+
+
 def build_threads(records: list[dict[str, Any]]) -> dict[str, Any]:
     """根据解析记录构建线程森林。
 
@@ -63,6 +75,7 @@ def build_threads(records: list[dict[str, Any]]) -> dict[str, Any]:
             "body_html_present": rec.get("body_html_present", False),
             "attachments": rec["attachments"],
             "received": rec.get("received", []),
+            "identity": rec.get("identity") or _empty_identity(),
             "issues": list(rec["issues"]),
             "children": [],
         }
