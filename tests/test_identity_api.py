@@ -54,6 +54,21 @@ FORWARD_EML = (
 # 缺 From / Message-ID / DKIM：全部无法核验
 MISSING_EML = b"To: B <b@x>\r\nSubject: anon\r\n\r\nanon"
 
+# 边界 1：重复 Return-Path，首值与 From 同域、第二值异域——第二值必须命中
+DUP_RP_EML = (
+    b"Message-ID: <dup-rp@example.com>\r\nFrom: A <a@example.com>\r\n"
+    b"Return-Path: <a@example.com>\r\n"
+    b"Return-Path: <bounce@evil.test>\r\n"
+    b"To: B <b@x>\r\nSubject: dup rp\r\n"
+    b"Date: Mon, 01 Sep 2026 14:00:00 +0000\r\n\r\ndup rp"
+)
+# 边界 2：无 From，但有 h= 不含 from 的 DKIM 签名——不得产生 observed 发现
+NO_FROM_BAD_DKIM_EML = (
+    b"Message-ID: <no-from@x.test>\r\n"
+    b"DKIM-Signature: v=1; d=evil.test; s=k; h=to:subject; b=zz\r\n"
+    b"To: B <b@x>\r\nSubject: no from\r\n\r\nno from"
+)
+
 # 案件用：两个包里同一 From 地址用不同 Message-ID 域（跨包回复）
 PACK_A = {
     "a.eml": (
@@ -329,6 +344,82 @@ class IdentityApiTest(unittest.TestCase):
         self.assertTrue(all(
             f["type"] == "reply_identity_change"
             for f in threads[0]["findings"]
+        ))
+
+    def test_05b_duplicate_return_path_second_value_mismatch(self):
+        """边界回归：重复 Return-Path 的异域后续值命中域不一致。"""
+        job_id = self.create_completed_job({"dup.eml": DUP_RP_EML})
+        done = self.completed_check(job_id)
+        cid = done["id"]
+
+        # 作业树节点保留两个 Return-Path，并记录重复头异常
+        status, _, body = self.client.request(
+            "GET", f"/api/v1/jobs/{job_id}/tree"
+        )
+        node = json.loads(body)["threads"][0]
+        rp = node["identity"]["return_path"]
+        self.assertEqual([e["domain"] for e in rp],
+                         ["example.com", "evil.test"])
+        self.assertTrue(
+            any(a["kind"] == "duplicate_header"
+                and a["header"] == "return-path"
+                for a in node["identity"]["anomalies"])
+        )
+
+        # 产生一条 from_domain_mismatch，命中第二个 Return-Path（index=1）
+        status, _, body = self.client.request(
+            "GET", f"/api/v1/identity-checks/{cid}/findings"
+            "?type=from_domain_mismatch"
+        )
+        findings = json.loads(body)["findings"]
+        self.assertEqual(len(findings), 1)
+        f = findings[0]
+        rp_cells = [c for c in f["evidence"]["comparisons"]
+                    if c["header"] == "Return-Path"]
+        self.assertEqual(len(rp_cells), 2)
+        mismatched = [c for c in f["evidence"]["mismatched"]
+                      if c["header"] == "Return-Path"]
+        self.assertEqual(len(mismatched), 1)
+        self.assertEqual(mismatched[0]["index"], 1)
+        self.assertEqual(mismatched[0]["domain"], "evil.test")
+        # 按异域域名筛选能命中
+        status, _, body = self.client.request(
+            "GET", f"/api/v1/identity-checks/{cid}/findings?domain=evil.test"
+        )
+        self.assertEqual(json.loads(body)["finding_count"], 1)
+
+    def test_05c_missing_from_uncovering_dkim_is_inconclusive(self):
+        """边界回归：缺 From 时 DKIM h= 未列 from 也不得 observed。"""
+        job_id = self.create_completed_job({"nf.eml": NO_FROM_BAD_DKIM_EML})
+        done = self.completed_check(job_id)
+        cid = done["id"]
+
+        # 不产生任何 dkim_from_not_covered 发现
+        status, _, body = self.client.request(
+            "GET", f"/api/v1/identity-checks/{cid}/findings"
+            "?type=dkim_from_not_covered"
+        )
+        self.assertEqual(json.loads(body)["finding_count"], 0)
+
+        # 邮件级检查为 inconclusive
+        status, _, body = self.client.request(
+            "GET", f"/api/v1/identity-checks/{cid}/emails?status=inconclusive"
+        )
+        emails = json.loads(body)["emails"]
+        self.assertEqual(len(emails), 1)
+        cell = emails[0]["checks"]["dkim_from_not_covered"]
+        self.assertEqual(cell["status"], "inconclusive")
+
+        # missing_header 待复核证据仍在
+        status, _, body = self.client.request(
+            "GET", f"/api/v1/identity-checks/{cid}/findings"
+        )
+        payload = json.loads(body)
+        missing = [r for r in payload["review_flags"]
+                   if r["kind"] == "missing_header"]
+        self.assertTrue(missing)
+        self.assertIn("From", ",".join(
+            h for r in missing for h in r["evidence"]["missing"]
         ))
 
     def test_06_case_check_and_source_deletion_independence(self):

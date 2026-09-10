@@ -43,9 +43,15 @@ class AddressHeaderTest(unittest.TestCase):
             [rp["raw"] for rp in ident["return_path"]],
             ["<x@example.com>", "<y@example.org>"],
         )
-        # 重复 From 本身不产生解析异常（From 允许多地址语义）
-        kinds = [a["kind"] for a in ident["anomalies"]]
-        self.assertNotIn("duplicate_header", kinds)
+        # 重复 From 不产生 duplicate_header（From 允许多地址语义）；
+        # 但单值的 Return-Path 重复出现必须记录 duplicate_header 异常，
+        # 且两个值都保留
+        dup = [
+            a for a in ident["anomalies"]
+            if a["kind"] == "duplicate_header"
+        ]
+        self.assertEqual(len(dup), 1)
+        self.assertEqual(dup[0]["header"], "return-path")
 
     def test_raw_folded_value_preserved(self):
         ident = parse(

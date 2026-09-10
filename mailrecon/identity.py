@@ -168,7 +168,7 @@ def _check_one_email(
 
     # ---- 1. From vs Sender / Return-Path 域不一致 -----------------------
     checks["from_domain_mismatch"] = _check_from_mismatch(
-        mail, from_first, sender_first, rp_first, signals, findings
+        mail, from_first, sender_entries, rp_entries, signals, findings
     )
 
     # ---- 3a. Message-ID 域 vs From 域（邮件级） -------------------------
@@ -212,8 +212,8 @@ def _check_one_email(
 def _check_from_mismatch(
     mail: dict[str, Any],
     from_first: dict[str, Any] | None,
-    sender_first: dict[str, Any] | None,
-    rp_first: dict[str, Any] | None,
+    sender_entries: list[dict[str, Any]],
+    rp_entries: list[dict[str, Any]],
     signals: list[str],
     findings: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -229,43 +229,48 @@ def _check_from_mismatch(
         }
     from_domain = from_first.get("domain")
 
-    for label, entry in (("Sender", sender_first), ("Return-Path", rp_first)):
-        if entry is None:
+    # 重复头（尤其 Return-Path 可能出现多个）的每个值都参与核验，
+    # 不能只看首值；每个值给出独立比较单元，附头出现序号 index
+    for label, entries in (("Sender", sender_entries), ("Return-Path", rp_entries)):
+        if not entries:
             comparisons.append(
                 {"header": label, "present": False, "match": None}
             )
             continue
         headers.append(label)
-        other_domain = entry.get("domain")
-        if other_domain is None:
-            comparisons.append(
-                {
-                    "header": label,
-                    "present": True,
-                    "address": entry.get("address"),
-                    "domain": None,
-                    "match": None,
-                    "note": "地址无法解析出有效域名",
-                }
-            )
-            continue
-        match = (other_domain == from_domain) if from_domain else None
-        cell = {
-            "header": label,
-            "present": True,
-            "address": entry.get("address"),
-            "domain": other_domain,
-            "match": match,
-        }
-        comparisons.append(cell)
-        if match is False:
-            mismatches.append(cell)
+        for entry in entries:
+            other_domain = entry.get("domain")
+            if other_domain is None:
+                comparisons.append(
+                    {
+                        "header": label,
+                        "index": entry.get("index"),
+                        "present": True,
+                        "address": entry.get("address"),
+                        "domain": None,
+                        "match": None,
+                        "note": "地址无法解析出有效域名",
+                    }
+                )
+                continue
+            match = (other_domain == from_domain) if from_domain else None
+            cell = {
+                "header": label,
+                "index": entry.get("index"),
+                "present": True,
+                "address": entry.get("address"),
+                "domain": other_domain,
+                "match": match,
+            }
+            comparisons.append(cell)
+            if match is False:
+                mismatches.append(cell)
 
     if not mismatches:
         return {
             "status": "observed" if from_domain else "inconclusive",
             "reason": (
-                "From 域可解析，Sender/Return-Path 未发现域不一致"
+                "From 域可解析，全部 Sender/Return-Path 值未发现域不一致"
                 if from_domain
                 else "From 地址缺少有效域名，无法比较"
             ),
@@ -283,7 +288,7 @@ def _check_from_mismatch(
         "sources": _sources(mail),
         "headers": headers,
         "summary": _from_mismatch_summary(from_first, mismatches, signals),
-        "basis": "比较 From 与 Sender/Return-Path 首个地址的域名（小写精确比较）",
+        "basis": "比较 From 与全部 Sender/Return-Path 值（含重复头）首个地址的域名（小写精确比较）",
         "evidence": {
             "from": _address_brief(from_first),
             "comparisons": comparisons,
@@ -389,6 +394,16 @@ def _check_dkim(
             "status": "inconclusive",
             "reason": "缺少 DKIM-Signature 头，无法核验 h= 是否覆盖 From（不代表无签名即伪造）",
             "signatures": [],
+        }
+
+    # From 缺失或不可解析时，无法断言“h= 未覆盖 From”（没有可被覆盖的
+    # From）：按证据不足标无法核验，绝不下 observed/未覆盖结论。
+    # missing_header 待复核证据已在邮件级检查中记录
+    if from_first is None or not from_first.get("address"):
+        return {
+            "status": "inconclusive",
+            "reason": "缺少可解析的 From 头，无法核验 DKIM h= 是否覆盖 From（不判定伪造）",
+            "signatures": signatures,
         }
 
     if not uncovered:
@@ -825,8 +840,12 @@ def _from_mismatch_summary(
     mismatches: list[dict[str, Any]],
     signals: list[str],
 ) -> str:
+    def label(cell: dict[str, Any]) -> str:
+        idx = cell.get("index")
+        return f"{cell['header']}#{idx}" if idx is not None else cell["header"]
+
     parts = [
-        f"{cell['header']} 域 {cell['domain']} ≠ From 域 {from_first.get('domain')}"
+        f"{label(cell)} 域 {cell['domain']} ≠ From 域 {from_first.get('domain')}"
         for cell in mismatches
     ]
     text = "From 与 " + "；".join(parts)

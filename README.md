@@ -10,6 +10,13 @@ SHA-256 归并、Message-ID 冲突并列保留、跨包补齐缺失父邮件。
 创建后台分析：按可配置阈值标出客户端时钟偏差、异常传输耗时、回复
 早于父邮件，同一 Message-ID 在不同来源中的传输链不一致时并列展示；
 缺时区、无法解析、相邻跳逆序等情况一律只标注证据、不做猜测。
+声明身份核验模块离线解析 From / Sender / Reply-To / Return-Path /
+Message-ID 与 DKIM-Signature（保留重复头与原始值，提取地址、域名及
+`d`/`s`/`i`/`h` 标签并记录异常），可对已完成作业或案件创建后台核验：
+按邮件和会话汇总 From 与 Sender/Return-Path 域不一致、回复链身份变化、
+Message-ID 域漂移、DKIM 的 `h` 未覆盖 From。**不查 DNS、不验证签名
+真伪**；转发、邮件列表与字段缺失只记为待复核证据，证据不足标无法核验，
+绝不判定伪造；每项发现都附来源文件、头字段与依据。
 
 * 仅使用 Python 标准库：`http.server`、`email`、`zipfile`、`sqlite3`；
 * 不修改、不回传任何原始邮件，附件只导出元数据（名称/类型/大小/SHA-256）；
@@ -22,24 +29,28 @@ SHA-256 归并、Message-ID 冲突并列保留、跨包补齐缺失父邮件。
 mailrecon/            服务源码
   config.py           上限/路径配置（环境变量可覆盖）
   zipguard.py         ZIP 安全校验与受控解压
-  mailparser.py       单封 .eml 解析（MIME/字符集/正文/附件/引用头/Received）
+  mailparser.py       单封 .eml 解析（MIME/字符集/正文/附件/引用头/Received/身份头）
   received.py         Received 头逐跳解析（UTC 换算 + 原始时区保留，不猜测）
+  idheaders.py        声明身份头解析（六头保留重复值/原始值，DKIM d/s/i/h，不验签）
   threads.py          会话树重建（缺失/成环/重复 ID 处理，迭代式）
   casemerge.py        案件级多包合并（去重/冲突/补链，迭代式）
   timing.py           传输时序核验引擎（五类结论，记录所用字段与阈值）
+  identity.py         声明身份核验引擎（四类发现 + 待复核证据/无法核验）
   jsonio.py           迭代式 JSON 解析/序列化（深引用链不受递归深度限制）
-  storage.py          SQLite 元数据 + 作业/案件/分析落盘文件管理
+  storage.py          SQLite 元数据 + 作业/案件/分析/核验落盘文件管理
   processor.py        后台作业流水线（单线程顺序处理）
   caseproc.py         后台案件合并流水线（单线程顺序处理）
   timeproc.py         后台时序核验流水线（单线程顺序处理，重启续跑）
+  identityproc.py     后台声明身份核验流水线（单线程顺序处理，重启续跑）
   server.py           HTTP API（http.server）
   __main__.py         启动入口
 scripts/
   make_sample.py      生成正常示例包 examples/sample-mails.zip
   make_case_sample.py 生成案件合并示例包 examples/case-pack-{1,2}.zip
   make_timing_sample.py 生成时序核验示例包 examples/timing-*.zip
+  make_identity_sample.py 生成身份核验示例包 examples/identity-*.zip
   make_evil.py        生成应被拒绝的恶意/超限 ZIP
-tests/                135 个 unittest 用例
+tests/                191 个 unittest 用例
 examples/             生成产物（正常包 + 案件/时序示例包 + evil/ 恶意包）
 docs/API.md           接口文档
 docs/API_EXAMPLES.sh  curl 调用示例
@@ -169,24 +180,68 @@ curl -X POST http://127.0.0.1:8080/api/v1/analyses \
           "thresholds": {"clock_skew_seconds": 120, "max_transit_seconds": 300}}'
 ```
 
+## 邮件声明身份核验
+
+每个作业/案件节点都带 `identity` 头块：解析期用 `email.message` 的
+`raw_items()` 按原始出现顺序保留 From / Sender / Reply-To /
+Return-Path / Message-ID / DKIM-Signature 的**全部重复头与逐字原始值**
+（折叠换行也保留），提取地址、域名，以及 DKIM 的 `d`/`s`/`i`/`h` 标签；
+畸形头、缺失/重复标签等只写入该头的 `anomalies`，不阻断解析。
+
+`POST /api/v1/identity-checks` 对已完成的作业或案件创建后台核验
+（接口详见 `docs/API.md` 第 16–20 节），**全程离线**：
+
+* `from_domain_mismatch` — From 与任一 Sender / Return-Path 值
+  （**重复头的每个值都参与**）域不一致；
+* `reply_identity_change` — 回复链上相邻两封邮件 From 域变化
+  （显示名相同却换域等形态），证据并列、不判伪造；
+* `message_id_domain_drift` — 邮件级 Message-ID 标识域 ≠ From 域；
+  会话级同一发件人在同一会话内标识域漂移；
+* `dkim_from_not_covered` — DKIM-Signature 的 `h=` 未列出 from
+  （只看覆盖关系，`b=` 签名字段绝不验证，不查 DNS）。
+
+结论三态：`observed`（客观差异）、`needs_review`（有转发/列表/多重签名
+等背景，待人工复核）、`inconclusive`（证据不足，无法核验）。转发
+（`Fwd:` 主题）、邮件列表迹象、字段缺失与头解析异常另列为
+`review_flags` 待复核证据；**缺 From 时既不判 From 域不一致，也不判
+DKIM“未覆盖 From”**，缺 DKIM 不代表无签名即伪造。每项发现都附
+`sources`（来源文件/作业）、`headers`（依据头字段）、`basis` 与
+`evidence`。支持进度查询、按类型/状态/域名筛选（`/findings`、`/emails`、
+`/threads`）与 JSON 下载；结果独立落盘，删除源作业/案件后仍可读，
+服务重启自动续跑未完成的核验。
+
+```bash
+python3 scripts/make_identity_sample.py   # 生成身份核验示例包
+# 上传 examples/identity-mails.zip 为作业后：
+curl -X POST http://127.0.0.1:8080/api/v1/identity-checks \
+     -H 'Content-Type: application/json' \
+     -d '{"target_type": "job", "target_id": "<job_id>"}'
+# 按类型筛选 / 按域名筛选 / 下载
+curl '.../identity-checks/<check_id>/findings?type=dkim_from_not_covered'
+curl '.../identity-checks/<check_id>/findings?domain=mailer.net'
+curl -OJ '.../identity-checks/<check_id>/result'
+```
+
 ## 作业落盘与删除
 
 ```
-DATA_DIR/mailrecon.db               SQLite 元数据（作业 + 案件 + 分析）
+DATA_DIR/mailrecon.db               SQLite 元数据（作业 + 案件 + 分析 + 核验）
 DATA_DIR/jobs/<job_id>/upload.bin   收到的原始 ZIP（字节不动）
 DATA_DIR/jobs/<job_id>/result.json  结果 JSON
 DATA_DIR/jobs/<job_id>/extract/     处理期间临时解压目录，完成后立即删除
 DATA_DIR/cases/<case_id>/result.json 案件合并结果（与源作业目录独立）
 DATA_DIR/analyses/<analysis_id>/result.json 时序核验结果（与源目标目录独立）
+DATA_DIR/identity_checks/<check_id>/result.json 身份核验结果（与源目标目录独立）
 ```
 
 `DELETE /api/v1/jobs/{id}` 会删除元数据并 `rmtree` 整个作业目录；
-服务重启后，上次未完成的作业、案件与时序核验分析会自动重新入队处理。
+服务重启后，上次未完成的作业、案件、时序核验分析与声明身份核验会自动
+重新入队处理。
 
 ## 测试
 
 ```bash
-python3 -m unittest discover -s tests -v     # 135 个用例
+python3 -m unittest discover -s tests -v     # 191 个用例
 ```
 
 ## 更多

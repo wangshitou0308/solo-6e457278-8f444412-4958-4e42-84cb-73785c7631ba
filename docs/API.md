@@ -13,7 +13,7 @@
 - 时序核验：每封邮件的全部 `Received` 头按原顺序解析保留（见第 4 节
   节点字段），可对已完成的作业/案件创建后台时序核验分析（第 12–15 节）。
 - 声明身份核验：每个节点新增 `identity` 头块（见第 4 节），可对已完成的
-  作业/案件创建后台声明身份核验（第 16–19 节）。**离线运行：不查 DNS、
+  作业/案件创建后台声明身份核验（第 16–20 节）。**离线运行：不查 DNS、
   不验证 DKIM 签名真伪**，只客观记录声明差异与待复核证据，证据不足时
   标注无法核验，绝不直接判定伪造。
 
@@ -668,6 +668,250 @@ Content-Disposition: attachment; filename="<analysis_id>.analysis-result.json"
 分析完成后删除源作业/案件不影响结果的读取与下载；服务重启后，
 未完成的分析会自动重新入队处理（沿用创建时的阈值）。
 
+## 16. 创建声明身份核验
+
+```
+POST /api/v1/identity-checks
+Content-Type: application/json
+```
+
+对一个**已完成**的作业或案件做邮件声明身份核验。解析期（见第 4 节
+`identity` 头块）已离线提取 From / Sender / Reply-To / Return-Path /
+Message-ID 的地址与域名，以及 DKIM-Signature 的 `d`/`s`/`i`/`h` 标签
+（保留重复头与原始值）。本核验在后台汇总四类声明差异。
+
+**离线边界（重要）**：不查 DNS、不校验 DKIM 签名（`b=`）真伪、不评价
+SPF/DMARC 对齐、**不做任何“伪造”定性**。转发（`Fwd:` 主题）、邮件列表
+迹象、字段缺失等只作为 `review_flags` 待复核证据；证据不足的检查标
+`inconclusive`（无法核验），不直接下结论。
+
+**请求体**
+
+```json
+{
+  "target_type": "job",
+  "target_id": "<已完成作业或案件的UUID>"
+}
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `target_type` | 是 | `"job"` 或 `"case"` |
+| `target_id` | 是 | 目标作业/案件 UUID |
+
+无阈值参数；出现未知字段返回 `400 bad_request`。
+
+**响应** `201 Created`：
+
+```json
+{
+  "id": "6b51f0a2-1c6b-4e94-8b3e-7d0b5f7a9201",
+  "status": "queued",
+  "created_at": "2026-09-10T21:00:00+00:00",
+  "updated_at": "2026-09-10T21:00:00+00:00",
+  "target_type": "job",
+  "target_id": "a0816b74-...",
+  "progress": 0,
+  "phase": null,
+  "error": null,
+  "email_count": 0,
+  "finding_count": 0,
+  "review_count": 0,
+  "stats": null
+}
+```
+
+**创建即校验**：目标不存在或已删除返回 `404 target_not_found`；
+目标未完成返回 `409 target_not_completed`；请求体非 JSON / 缺字段 /
+ID 格式非法 / 未知字段返回 `400 bad_request`。
+
+### 发现类型与状态
+
+| type | scope | 含义 |
+|---|---|---|
+| `from_domain_mismatch` | email | From 与任一 Sender / Return-Path 值（含重复头的每个值）域不一致 |
+| `reply_identity_change` | thread | 沿回复链父子边，相邻两封邮件 From 域变化 |
+| `message_id_domain_drift` | email / thread | 邮件级：Message-ID 标识域 ≠ From 域；会话级：同一发件人在同一会话内 Message-ID 域漂移 |
+| `dkim_from_not_covered` | email | 某 DKIM-Signature 的 `h=` 未列出 from（未查 DNS、未验签） |
+
+每条 `finding` 的 `status`：
+
+* `observed` — 客观观察到声明差异（不代表伪造）；
+* `needs_review` — 存在转发 / 邮件列表 / 多重签名等背景，需人工复核；
+* `inconclusive` — 证据不足（字段缺失等），无法核验。
+
+每条发现都带 `sources`（来源文件/作业）、`headers`（依据的具体头字段）、
+`basis`（判定依据说明）与 `evidence`（具体取值）。待复核背景与字段缺失
+另列为 `review_flags`，`kind` 为 `possible_forward` /
+`possible_mailing_list` / `missing_header` / `header_parse_anomaly`。
+
+## 17. 查询核验进度 / 核验列表
+
+```
+GET /api/v1/identity-checks/{check_id}
+GET /api/v1/identity-checks
+```
+
+`status`：`queued` → `processing` → `completed` | `failed`
+
+`phase` 依次为：`loading_target`、`flattening_threads`、
+`checking_identity`、`writing_result`、`completed` / `failed`。
+`progress` 为 0–100 整数；`failed` 时 `error` 给出原因（例如目标在核验
+处理前被删除）。完成后 `stats` 结构：
+
+```json
+{
+  "emails": 9,
+  "thread_count": 4,
+  "findings_total": 9,
+  "findings_by_type": {
+    "from_domain_mismatch": 3,
+    "reply_identity_change": 1,
+    "message_id_domain_drift": 1,
+    "dkim_from_not_covered": 4
+  },
+  "findings_by_status": {
+    "observed": 2,
+    "needs_review": 7,
+    "inconclusive": 0
+  },
+  "review_flags_total": 8,
+  "review_flags_by_kind": {
+    "possible_forward": 1,
+    "possible_mailing_list": 3,
+    "missing_header": 1,
+    "header_parse_anomaly": 3
+  },
+  "inconclusive_checks": {
+    "from_domain_mismatch": 0,
+    "message_id_domain_drift": 0,
+    "dkim_from_not_covered": 1
+  }
+}
+```
+
+## 18. 读取发现 / 按邮件汇总 / 按会话汇总（可筛选）
+
+核验 `completed` 后可用，否则 `409 not_ready`。
+
+### 18.1 发现与待复核证据（按类型 / 状态 / 域名筛选）
+
+```
+GET /api/v1/identity-checks/{check_id}/findings
+GET /api/v1/identity-checks/{check_id}/findings?type=dkim_from_not_covered
+GET /api/v1/identity-checks/{check_id}/findings?status=needs_review
+GET /api/v1/identity-checks/{check_id}/findings?domain=mailer.net
+```
+
+| 参数 | 说明 |
+|---|---|
+| `type` | 发现类型，须为 `from_domain_mismatch` / `reply_identity_change` / `message_id_domain_drift` / `dkim_from_not_covered`，未知值返回 400 |
+| `status` | `observed` / `needs_review` / `inconclusive`，未知值返回 400 |
+| `domain` | 域名（大小写不敏感，含子域）；筛选证据中涉及该域的发现。空值返回 400 |
+
+参数可组合。响应顶层为 `findings`（差异发现）与 `review_flags`
+（转发/列表/缺失/解析异常等待复核证据），各带 `finding_count` /
+`review_flag_count` 与回显的 `filters`。每条发现示例：
+
+```json
+{
+  "id": "F0001",
+  "type": "from_domain_mismatch",
+  "scope": "email",
+  "status": "needs_review",
+  "node_uids": [1],
+  "message_ids": ["<mm@example.com>"],
+  "sources": [ { "job_id": "...", "source_file": "mismatch.eml" } ],
+  "headers": ["From", "Return-Path"],
+  "summary": "From 与 Return-Path#1 域 evil.test ≠ From 域 example.com；仅记录声明域差异，不判定伪造",
+  "basis": "比较 From 与全部 Sender/Return-Path 值（含重复头）首个地址的域名（小写精确比较）",
+  "evidence": {
+    "from": { "address": "a@example.com", "name": "A", "domain": "example.com" },
+    "comparisons": [
+      { "header": "Return-Path", "index": 0, "present": true, "address": "a@example.com", "domain": "example.com", "match": true },
+      { "header": "Return-Path", "index": 1, "present": true, "address": "bounce@evil.test", "domain": "evil.test", "match": false }
+    ],
+    "mismatched": [ { "header": "Return-Path", "index": 1, "domain": "evil.test", "match": false } ],
+    "review_signals": []
+  }
+}
+```
+
+约定：
+
+* 重复 Sender / Return-Path 的**每个值**都参与比较，`comparisons` /
+  `mismatched` 单元带 `index`（头出现序号，0 = 最上方）；
+* 案件分析的 `sources` 为 `{case_id, sources:[...]}`（含全部来源作业）；
+* 会话级发现（`scope=thread`）的 `node_uids` 为回复链上相关节点。
+
+### 18.2 按邮件汇总
+
+```
+GET /api/v1/identity-checks/{check_id}/emails
+GET /api/v1/identity-checks/{check_id}/emails?type=from_domain_mismatch
+GET /api/v1/identity-checks/{check_id}/emails?status=inconclusive
+GET /api/v1/identity-checks/{check_id}/emails?domain=example.com
+```
+
+每封邮件一项，含 From / Sender / Return-Path / Reply-To 域、Message-ID
+域、各 DKIM 签名（`d`/`s`/`i`/`covers_from`）、背景信号 `signals` 与三类
+邮件级检查单元 `checks`（每项带 `status` / `reason`，差异类还带
+`match: false`）。
+
+* `type` 仅接受邮件级类型：`from_domain_mismatch` /
+  `message_id_domain_drift` / `dkim_from_not_covered`；传会话级的
+  `reply_identity_change` 返回 400。类型筛选只返回**确有差异/待复核**
+  的邮件（一致的正常邮件不返回）；
+* 无法核验的邮件用 `status=inconclusive` 筛选（如缺 From / DKIM）。
+
+### 18.3 按会话汇总
+
+```
+GET /api/v1/identity-checks/{check_id}/threads
+GET /api/v1/identity-checks/{check_id}/threads?type=reply_identity_change
+GET /api/v1/identity-checks/{check_id}/threads?domain=example-corp.example
+```
+
+每个会话（线程树）一项：`root_uid` / `root_message_id` /
+`root_subject` / `email_count` / `node_uids` / `finding_ids` /
+`identity_sequences`（链上每封的 From 与标识域序列），并内联该会话命中
+的 `findings`。`type` / `domain` 筛选作用于内联发现；无命中的会话不返回。
+
+## 19. 核验的证据与无法核验口径
+
+* **每条发现可溯源**：`sources` 指出来源文件（作业）或全部来源作业
+  （案件），`headers` 指出依据的具体头字段，`evidence` 给出具体取值，
+  `basis` 给出人类可读判定依据；
+* **转发 / 邮件列表 / 字段缺失只记待复核证据**：不直接判为差异，相关
+  发现降级为 `needs_review`；
+* **证据不足标 `inconclusive`（无法核验），绝不判定伪造**。例如：
+  缺 From 时无法核验 From/Sender 域一致性，也无法断言 DKIM `h=`
+  “未覆盖 From”（没有可被覆盖的 From）；缺 DKIM-Signature 时
+  `dkim_from_not_covered` 为 `inconclusive`（不代表无签名即伪造）；
+* DKIM 只检查 `h=` 是否列出 from 这一**覆盖关系**，`b=` 签名字段绝不
+  验证；多重签名中部分覆盖、或 `h=` 无法解析时为 `needs_review`。
+
+## 20. 下载核验结果 JSON
+
+```
+GET /api/v1/identity-checks/{check_id}/result
+```
+
+`200`，响应头：
+
+```
+Content-Type: application/json; charset=utf-8
+Content-Disposition: attachment; filename="<check_id>.identity-result.json"
+```
+
+响应体为完整结果文件（顶层含 `identity_check_id`、`target_type`、
+`target_id`、`target`、`stats`、`findings`、`review_flags`、
+`email_reports`、`thread_reports`）。完成前请求返回 `409 not_ready`。
+
+**结果独立落盘**（`DATA_DIR/identity_checks/<check_id>/result.json`）：
+核验完成后删除源作业/案件不影响结果的读取与下载；服务重启后，未完成的
+核验会自动重新入队处理。
+
 ## 错误响应格式
 
 所有错误统一为：
@@ -679,21 +923,21 @@ Content-Disposition: attachment; filename="<analysis_id>.analysis-result.json"
 
 | 状态码 | code | 触发场景 |
 |---|---|---|
-| 400 | `bad_request` | 请求体为空、multipart 缺 `file`、作业/案件/分析 ID 格式非法、Idempotency-Key 格式非法、案件/分析请求体非合法 JSON、案件作业数超限、分析阈值非法、时间线筛选参数非法 |
-| 404 | `not_found` | 路径或作业/案件/分析不存在 |
+| 400 | `bad_request` | 请求体为空、multipart 缺 `file`、作业/案件/分析/核验 ID 格式非法、Idempotency-Key 格式非法、案件/分析/核验请求体非合法 JSON、案件作业数超限、分析阈值非法、时间线/核验筛选参数非法（未知 type/status、空 domain、邮件端点传会话级类型） |
+| 404 | `not_found` | 路径或作业/案件/分析/核验不存在 |
 | 404 | `job_not_found` | 创建案件时引用的源作业不存在或已删除 |
-| 404 | `target_not_found` | 创建分析时引用的目标作业/案件不存在或已删除 |
+| 404 | `target_not_found` | 创建分析/核验时引用的目标作业/案件不存在或已删除 |
 | 409 | `idempotency_conflict` | 同 Key 不同内容 |
-| 409 | `not_ready` | 作业/案件/分析未完成时取树/时间线/结果 |
+| 409 | `not_ready` | 作业/案件/分析/核验未完成时取树/时间线/发现/结果 |
 | 409 | `job_processing` | 删除正在处理的作业 |
 | 409 | `job_not_completed` | 创建案件时引用的源作业未完成 |
-| 409 | `target_not_completed` | 创建分析时引用的目标作业/案件未完成 |
+| 409 | `target_not_completed` | 创建分析/核验时引用的目标作业/案件未完成 |
 | 409 | `duplicate_job` | 同一作业在同一案件中重复提交 |
 | 409 | `case_too_large` | 案件邮件总量超过 `MAILRECON_MAX_CASE_EMAILS` |
 | 411 | `length_required` | 缺 Content-Length |
 | 413 | `payload_too_large` | 超过上传体积上限 |
 | 415 | `unsupported_media_type` | Content-Type 不是支持的类型 |
-| 500 | `internal_error` | 未预期内部错误（作业/案件/分析内部异常会落为对应 `failed`，不会返回 500） |
+| 500 | `internal_error` | 未预期内部错误（作业/案件/分析/核验内部异常会落为对应 `failed`，不会返回 500） |
 
 ZIP 安全/超限问题不使用上述 HTTP 错误码——上传会被受理（201），
 后台校验失败后体现在作业的 `status=failed` 与 `error` 文本中，

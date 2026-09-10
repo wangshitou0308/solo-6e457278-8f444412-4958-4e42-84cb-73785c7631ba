@@ -43,6 +43,7 @@ def make_mail(
     from_addr: str | None = "a@example.com",
     sender: str | None = None,
     return_path: str | None = None,
+    return_paths: list[str] | None = None,
     reply_to: str | None = None,
     message_id: str | None = "<m@example.com>",
     dkim: list[dict] | None = None,
@@ -50,11 +51,19 @@ def make_mail(
     parent_uid: int | None = None,
     source_file: str | None = None,
 ) -> dict:
+    rp_values = return_paths if return_paths is not None else (
+        [return_path] if return_path else []
+    )
+    rp_entries = []
+    for idx, value in enumerate(rp_values):
+        entry = from_entry(value)
+        entry["index"] = idx
+        rp_entries.append(entry)
     ident = {
         "from": [from_entry(from_addr)] if from_addr else [],
         "sender": [from_entry(sender)] if sender else [],
         "reply_to": [from_entry(reply_to)] if reply_to else [],
-        "return_path": [from_entry(return_path)] if return_path else [],
+        "return_path": rp_entries,
         "message_id": (
             {"present": True, "headers": [
                 mid_entry(message_id, message_id.strip("<>").rsplit("@", 1)[-1])
@@ -149,6 +158,67 @@ class FromDomainMismatchTest(unittest.TestCase):
         # 待复核证据单独列出
         kinds = {r["kind"] for r in result["review_flags"]}
         self.assertIn("possible_mailing_list", kinds)
+
+    def test_duplicate_return_path_all_values_checked(self):
+        """回归：重复 Return-Path 的后续异域值也必须产生域不一致发现。"""
+        # 第一个 Return-Path 与 From 同域（看似正常），第二个异域——
+        # 旧实现只看首值会漏报；现在两个值都参与核验
+        mails = [make_mail(
+            0, from_addr="a@example.com",
+            return_paths=["a@example.com", "bounce@evil.test"],
+        )]
+        result = identity.analyze(mails)
+        found = findings_of(result, "from_domain_mismatch")
+        self.assertEqual(len(found), 1)
+        f = found[0]
+        # 第二个值（index=1）异域，必须出现在 mismatched 中
+        rp_cells = [
+            c for c in f["evidence"]["comparisons"]
+            if c["header"] == "Return-Path"
+        ]
+        self.assertEqual(len(rp_cells), 2)  # 两个重复值都参与
+        by_index = {c["index"]: c for c in rp_cells}
+        self.assertTrue(by_index[0]["match"])
+        self.assertFalse(by_index[1]["match"])
+        mismatched_rp = [
+            c for c in f["evidence"]["mismatched"]
+            if c["header"] == "Return-Path"
+        ]
+        self.assertEqual(len(mismatched_rp), 1)
+        self.assertEqual(mismatched_rp[0]["index"], 1)
+        self.assertEqual(mismatched_rp[0]["domain"], "evil.test")
+        # 邮件级检查单元含全部比较
+        cell = result["email_reports"][0]["checks"]["from_domain_mismatch"]
+        self.assertEqual(cell["status"], "observed")
+        self.assertFalse(cell["match"])
+        # 邮件报告保留两个 Return-Path 域
+        self.assertEqual(
+            result["email_reports"][0]["return_path_domains"],
+            ["example.com", "evil.test"],
+        )
+
+    def test_duplicate_return_path_header_anomaly_recorded(self):
+        """回归：重复 Return-Path 头必须记录 duplicate_header 异常。"""
+        # 直接走解析层，确认重复头被标记
+        from email import message_from_bytes
+        from email.policy import default
+        from mailrecon.idheaders import parse_identity_headers
+
+        msg = message_from_bytes(
+            b"From: A <a@example.com>\r\n"
+            b"Return-Path: <a@example.com>\r\n"
+            b"Return-Path: <bounce@evil.test>\r\n\r\n",
+            policy=default,
+        )
+        ident = parse_identity_headers(msg)
+        self.assertEqual(len(ident["return_path"]), 2)
+        dups = [
+            a for a in ident["anomalies"]
+            if a["kind"] == "duplicate_header"
+            and a["header"] == "return-path"
+        ]
+        self.assertEqual(len(dups), 1)
+        self.assertIn("2", dups[0]["detail"])
 
 
 class MessageIdDomainDriftTest(unittest.TestCase):
@@ -250,6 +320,39 @@ class DkimCoverageTest(unittest.TestCase):
         cell = result["email_reports"][0]["checks"]["dkim_from_not_covered"]
         self.assertEqual(cell["status"], "inconclusive")
         self.assertIn("不代表无签名即伪造", cell["reason"])
+
+    def test_missing_from_with_uncovering_dkim_is_inconclusive(self):
+        """回归：缺 From 时即便 DKIM h= 未列 from，也不得产生 observed 发现。"""
+        # 无 From，但有一个 h= 不含 from 的签名——没有可被覆盖的 From，
+        # 必须标无法核验，而不是 observed“未覆盖 From”
+        mails = [make_mail(
+            0, from_addr=None,
+            dkim=[dkim_entry("evil.test", ["to", "subject"])],
+        )]
+        result = identity.analyze(mails)
+        # 不产生任何 dkim_from_not_covered 发现
+        self.assertEqual(findings_of(result, "dkim_from_not_covered"), [])
+        cell = result["email_reports"][0]["checks"]["dkim_from_not_covered"]
+        self.assertEqual(cell["status"], "inconclusive")
+        self.assertIn("From", cell["reason"])
+        # missing_header 待复核证据仍在，且列出 From
+        missing = [
+            r for r in result["review_flags"] if r["kind"] == "missing_header"
+        ]
+        self.assertTrue(missing)
+        all_missing = [h for r in missing for h in r["evidence"]["missing"]]
+        self.assertIn("From", all_missing)
+
+    def test_missing_from_with_covering_dkim_also_inconclusive(self):
+        """缺 From 时即便签名 h= 含 from，同样无法核验（无 From 可覆盖）。"""
+        mails = [make_mail(
+            0, from_addr=None,
+            dkim=[dkim_entry("example.com", ["from", "to"])],
+        )]
+        result = identity.analyze(mails)
+        self.assertEqual(findings_of(result, "dkim_from_not_covered"), [])
+        cell = result["email_reports"][0]["checks"]["dkim_from_not_covered"]
+        self.assertEqual(cell["status"], "inconclusive")
 
     def test_dual_signature_one_covers_is_needs_review(self):
         mails = [make_mail(0, dkim=[

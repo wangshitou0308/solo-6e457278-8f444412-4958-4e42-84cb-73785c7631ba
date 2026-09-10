@@ -85,6 +85,23 @@ def parse_identity_headers(msg: Message) -> dict[str, Any]:
         entries = []
         for index, (raw_value, _orig_name) in enumerate(buckets[header_name]):
             entries.append(_parse_address_entry(header_name, index, raw_value, anomalies))
+        # RFC 5322：From/Reply-To 可由多个地址构成（允许重复头），
+        # 但 Sender/Return-Path 应只出现一次；重复出现时全部值保留并
+        # 参与核验，同时记录 duplicate_header 异常（不做取舍）
+        if len(entries) > 1 and header_name in ("sender", "return-path"):
+            display = {
+                "from": "From", "sender": "Sender",
+                "reply-to": "Reply-To", "return-path": "Return-Path",
+            }.get(header_name, header_name)
+            anomalies.append(
+                _anomaly(
+                    "duplicate_header",
+                    header_name,
+                    None,
+                    f"出现 {len(entries)} 个 {display} 头（按 RFC 应只有一个），"
+                    "已全部保留并参与核验、未做取舍",
+                )
+            )
         result[key] = entries
 
     result["message_id"] = _parse_message_id(buckets["message-id"], anomalies)

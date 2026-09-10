@@ -213,3 +213,103 @@ curl -s -X DELETE "$BASE/api/v1/jobs/$CA" > /dev/null
 curl -s -X DELETE "$BASE/api/v1/jobs/$CB" > /dev/null
 curl -s "$BASE/api/v1/analyses/$TAN" | python3 -c \
   "import json,sys; j=json.load(sys.stdin); print('分析结果仍可读:', j['status'], '结论数:', j['finding_count'])"
+
+# ================================================================ 声明身份核验
+# 前置：python3 scripts/make_identity_sample.py 生成
+#   examples/identity-mails.zip       四类发现 + 转发/列表/缺字段/重复 Return-Path
+#   examples/identity-list-{a,b}.zip  同一发件人跨来源 Message-ID 域漂移（案件级）
+
+# ---------------------------------------------------------------- 20. 上传示例包并创建身份核验
+IDJOB=$(curl -s -X POST "$BASE/api/v1/jobs" \
+  -F 'file=@examples/identity-mails.zip;type=application/zip' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+while :; do
+  S=$(curl -s "$BASE/api/v1/jobs/$IDJOB" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+  [ "$S" = completed ] && break
+  [ "$S" = failed ] && { echo "作业失败: $IDJOB"; exit 1; }
+  sleep 0.5
+done
+# 节点 identity 头块保留重复头与原始值（DKIM 原始折叠、重复 Return-Path）
+curl -s "$BASE/api/v1/jobs/$IDJOB/tree" | python3 -c \
+  "import json,sys; n=json.load(sys.stdin)['threads'][0]; print(json.dumps(n['identity'], ensure_ascii=False, indent=2))" | head -40
+
+# 创建核验：仅需 target_type/target_id，无阈值参数，离线运行、不查 DNS、不验签
+IC_JSON=$(curl -s -X POST "$BASE/api/v1/identity-checks" \
+  -H 'Content-Type: application/json' \
+  -d "{\"target_type\": \"job\", \"target_id\": \"$IDJOB\"}")
+echo "$IC_JSON"
+IC=$(python3 -c "import json,sys; print(json.loads(sys.stdin.read())['id'])" <<<"$IC_JSON")
+
+# ---------------------------------------------------------------- 21. 轮询核验进度
+while :; do
+  ICSTAT=$(curl -s "$BASE/api/v1/identity-checks/$IC")
+  STATUS=$(python3 -c "import json,sys; print(json.load(sys.stdin)['status'])" <<<"$ICSTAT")
+  echo "$ICSTAT" | python3 -c "import json,sys; j=json.load(sys.stdin); print(j['status'], j['progress'], j['phase'])"
+  if [ "$STATUS" = completed ] || [ "$STATUS" = failed ]; then break; fi
+  sleep 0.5
+done
+# findings_by_type / findings_by_status / inconclusive_checks 汇总
+echo "$ICSTAT" | python3 -m json.tool
+
+# ---------------------------------------------------------------- 22. 读取发现并按类型/状态/域名筛选
+# 全部发现 + 待复核证据（review_flags：转发/列表/缺头/解析异常）
+curl -s "$BASE/api/v1/identity-checks/$IC/findings" | python3 -m json.tool
+# 只看 DKIM h= 未覆盖 From
+curl -s "$BASE/api/v1/identity-checks/$IC/findings?type=dkim_from_not_covered" | python3 -m json.tool
+# 只看待人工复核（转发/列表/多重签名背景）
+curl -s "$BASE/api/v1/identity-checks/$IC/findings?status=needs_review" | python3 -m json.tool
+# 按域名筛选（含子域）：命中所有涉及该域的发现
+curl -s "$BASE/api/v1/identity-checks/$IC/findings?domain=mailer.net" | python3 -m json.tool
+# 未知 type / 空 domain 返回 400
+curl -s "$BASE/api/v1/identity-checks/$IC/findings?type=bogus"; echo
+
+# ---------------------------------------------------------------- 23. 按邮件 / 按会话汇总
+# 按邮件：每封邮件的三类邮件级检查单元（含 inconclusive 无法核验）
+curl -s "$BASE/api/v1/identity-checks/$IC/emails" | python3 -m json.tool
+# 只看证据不足（无法核验）的邮件，例如缺 From / DKIM
+curl -s "$BASE/api/v1/identity-checks/$IC/emails?status=inconclusive" | python3 -m json.tool
+# 只看 From 域不一致的邮件
+curl -s "$BASE/api/v1/identity-checks/$IC/emails?type=from_domain_mismatch" | python3 -m json.tool
+# 按会话：回复链身份变化、同会话标识域漂移，内联 findings
+curl -s "$BASE/api/v1/identity-checks/$IC/threads" | python3 -m json.tool
+curl -s "$BASE/api/v1/identity-checks/$IC/threads?type=reply_identity_change" | python3 -m json.tool
+
+# ---------------------------------------------------------------- 24. 下载核验结果 JSON（独立持久化）
+curl -s -D - "$BASE/api/v1/identity-checks/$IC/result" -o "/tmp/${IC}.identity-result.json"
+python3 -m json.tool "/tmp/${IC}.identity-result.json" | head -40 || true
+
+# ---------------------------------------------------------------- 25. 案件级：跨包 Message-ID 域漂移 + 删除源数据后仍可读
+LA=$(curl -s -X POST "$BASE/api/v1/jobs" -F 'file=@examples/identity-list-a.zip;type=application/zip' | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+LB=$(curl -s -X POST "$BASE/api/v1/jobs" -F 'file=@examples/identity-list-b.zip;type=application/zip' | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+for J in "$LA" "$LB"; do
+  while :; do
+    S=$(curl -s "$BASE/api/v1/jobs/$J" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+    [ "$S" = completed ] && break
+    [ "$S" = failed ] && { echo "作业失败: $J"; exit 1; }
+    sleep 0.5
+  done
+done
+ICASE=$(curl -s -X POST "$BASE/api/v1/cases" -H 'Content-Type: application/json' \
+  -d "{\"name\": \"身份域漂移案\", \"job_ids\": [\"$LA\", \"$LB\"]}" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+while :; do
+  S=$(curl -s "$BASE/api/v1/cases/$ICASE" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+  [ "$S" = completed ] && break
+  sleep 0.5
+done
+ICC=$(curl -s -X POST "$BASE/api/v1/identity-checks" -H 'Content-Type: application/json' \
+  -d "{\"target_type\": \"case\", \"target_id\": \"$ICASE\"}" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+while :; do
+  S=$(curl -s "$BASE/api/v1/identity-checks/$ICC" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+  [ "$S" = completed ] && break
+  sleep 0.5
+done
+# 会话级 message_id_domain_drift，evidence.domains 并列两个标识域
+curl -s "$BASE/api/v1/identity-checks/$ICC/findings?type=message_id_domain_drift" | python3 -m json.tool
+# 删除源作业：核验结果仍可下载
+curl -s -X DELETE "$BASE/api/v1/jobs/$LA" > /dev/null
+curl -s -X DELETE "$BASE/api/v1/jobs/$LB" > /dev/null
+curl -s "$BASE/api/v1/identity-checks/$ICC/result" | python3 -c \
+  "import json,sys; r=json.load(sys.stdin); print('核验结果仍可读, 发现数:', r['stats']['findings_total'])"
+
