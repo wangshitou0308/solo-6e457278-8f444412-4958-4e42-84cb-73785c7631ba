@@ -21,6 +21,11 @@
 
     DATA_DIR/identity_checks/<check_id>/
         result.json    # 声明身份发现、待复核证据、按邮件/会话汇总
+
+附件流转追踪目录布局（独立落盘，删除源作业/案件不影响已完成追踪）::
+
+    DATA_DIR/attachment_flows/<flow_id>/
+        result.json    # 流转事件、待复核项、内容台账与按邮件汇总
 """
 
 from __future__ import annotations
@@ -97,6 +102,22 @@ CREATE TABLE IF NOT EXISTS identity_checks (
     error             TEXT,
     email_count       INTEGER NOT NULL DEFAULT 0,
     finding_count     INTEGER NOT NULL DEFAULT 0,
+    review_count      INTEGER NOT NULL DEFAULT 0,
+    stats_json        TEXT,
+    result_path       TEXT
+);
+CREATE TABLE IF NOT EXISTS attachment_flows (
+    id                TEXT PRIMARY KEY,
+    status            TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    target_type       TEXT NOT NULL,
+    target_id         TEXT NOT NULL,
+    progress          INTEGER NOT NULL DEFAULT 0,
+    phase             TEXT,
+    error             TEXT,
+    email_count       INTEGER NOT NULL DEFAULT 0,
+    event_count       INTEGER NOT NULL DEFAULT 0,
     review_count      INTEGER NOT NULL DEFAULT 0,
     stats_json        TEXT,
     result_path       TEXT
@@ -660,6 +681,142 @@ class Storage:
             ).fetchall()
         return [_identity_row_to_dict(row) for row in rows]
 
+    # ------------------------------------------------------ 附件流转目录
+
+    @staticmethod
+    def attachment_flow_dir(flow_id: str) -> Path:
+        return config.DATA_DIR / "attachment_flows" / flow_id
+
+    @classmethod
+    def prepare_attachment_flow_dir(cls, flow_id: str) -> Path:
+        path = cls.attachment_flow_dir(flow_id)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    # ------------------------------------------------------ 附件流转 CRUD
+
+    def create_attachment_flow(
+        self,
+        flow_id: str,
+        target_type: str,
+        target_id: str,
+    ) -> None:
+        now = utc_now()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO attachment_flows (id, status, created_at,
+                                              updated_at, target_type,
+                                              target_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    flow_id,
+                    config.STATUS_QUEUED,
+                    now,
+                    now,
+                    target_type,
+                    target_id,
+                ),
+            )
+
+    def get_attachment_flow(self, flow_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM attachment_flows WHERE id = ?", (flow_id,)
+            ).fetchone()
+        return _flow_row_to_dict(row) if row else None
+
+    def list_attachment_flows(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM attachment_flows ORDER BY created_at DESC "
+                "LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [_flow_row_to_dict(row) for row in rows]
+
+    def update_attachment_flow_progress(
+        self,
+        flow_id: str,
+        status: str | None = None,
+        progress: int | None = None,
+        phase: str | None = None,
+    ) -> None:
+        sets = ["updated_at = ?"]
+        params: list[Any] = [utc_now()]
+        if status is not None:
+            sets.append("status = ?")
+            params.append(status)
+        if progress is not None:
+            sets.append("progress = ?")
+            params.append(progress)
+        if phase is not None:
+            sets.append("phase = ?")
+            params.append(phase)
+        params.append(flow_id)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE attachment_flows SET {', '.join(sets)} WHERE id = ?",
+                params,
+            )
+
+    def complete_attachment_flow(
+        self,
+        flow_id: str,
+        result_path: str,
+        email_count: int,
+        event_count: int,
+        review_count: int,
+        stats: dict[str, Any],
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE attachment_flows SET status = ?, updated_at = ?,
+                    progress = 100, phase = ?, error = NULL, email_count = ?,
+                    event_count = ?, review_count = ?, stats_json = ?,
+                    result_path = ?
+                WHERE id = ?
+                """,
+                (
+                    config.STATUS_COMPLETED,
+                    utc_now(),
+                    "completed",
+                    email_count,
+                    event_count,
+                    review_count,
+                    json.dumps(stats, ensure_ascii=False),
+                    result_path,
+                    flow_id,
+                ),
+            )
+
+    def fail_attachment_flow(self, flow_id: str, error: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE attachment_flows SET status = ?, updated_at = ?,
+                    phase = ?, error = ? WHERE id = ?
+                """,
+                (
+                    config.STATUS_FAILED,
+                    utc_now(),
+                    "failed",
+                    error,
+                    flow_id,
+                ),
+            )
+
+    def unfinished_attachment_flows(self) -> list[dict[str, Any]]:
+        """服务重启后找出卡在 processing/queued 的附件流转追踪。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM attachment_flows WHERE status IN (?, ?)",
+                (config.STATUS_PROCESSING, config.STATUS_QUEUED),
+            ).fetchall()
+        return [_flow_row_to_dict(row) for row in rows]
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -692,6 +849,12 @@ def _analysis_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _identity_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    data["stats"] = _parse_stats(data.pop("stats_json", None))
+    return data
+
+
+def _flow_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
     data["stats"] = _parse_stats(data.pop("stats_json", None))
     return data

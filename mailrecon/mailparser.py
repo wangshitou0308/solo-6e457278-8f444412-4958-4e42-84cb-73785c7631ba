@@ -314,6 +314,15 @@ def _html_to_text(html: str) -> str:
 
 # ---------------------------------------------------------------- 附件
 
+# 传输编码损坏类缺陷（base64 非法字符/长度/填充）：解析器会尽力给出字节，
+# 但结果不可信，附件流转追踪时按“内容无法解码”处理
+_DECODE_DEFECT_NAMES = {
+    "InvalidBase64CharactersDefect",
+    "InvalidBase64LengthDefect",
+    "InvalidBase64PaddingDefect",
+}
+
+
 def _extract_attachments(
     msg: EmailMessage,
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -339,6 +348,9 @@ def _extract_attachments(
         if not filename:
             filename = f"unnamed-{index + 1}.bin"
 
+        # undecodable=True 表示内容无法可靠解码：此时记录的 size/sha256
+        # 只是占位值，附件流转追踪不得用它推断流转（只列为待复核）
+        undecodable = False
         try:
             payload = part.get_payload(decode=True)
         except Exception as exc:
@@ -347,9 +359,30 @@ def _extract_attachments(
                 f"{type(exc).__name__}: {exc}"
             )
             payload = None
+            undecodable = True
         if payload is None:
             payload = b""
+            undecodable = True
             issues.append(f"附件 {filename!r} 内容无法解码，大小按 0 记录")
+        elif not isinstance(payload, (bytes, bytearray)):
+            # 防御：传输解码未给出字节，无法计算可靠哈希
+            payload = b""
+            undecodable = True
+            issues.append(
+                f"附件 {filename!r} 内容无法解码（载荷非字节），大小按 0 记录"
+            )
+
+        decode_defects = [
+            type(defect).__name__
+            for defect in part.defects
+            if type(defect).__name__ in _DECODE_DEFECT_NAMES
+        ]
+        if decode_defects and not undecodable:
+            undecodable = True
+            issues.append(
+                f"附件 {filename!r} 传输编码损坏"
+                f"（{', '.join(decode_defects)}），无法解码出可靠内容"
+            )
 
         for defect in part.defects:
             issues.append(
@@ -367,12 +400,13 @@ def _extract_attachments(
         else:
             used_names[filename] = 0
 
-        attachments.append(
-            {
-                "filename": unique_name,
-                "content_type": content_type,
-                "size": len(payload),
-                "sha256": hashlib.sha256(payload).hexdigest(),
-            }
-        )
+        attachment = {
+            "filename": unique_name,
+            "content_type": content_type,
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        if undecodable:
+            attachment["undecodable"] = True
+        attachments.append(attachment)
     return attachments, issues

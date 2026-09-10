@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from . import config, identity, jsonio, timing
+from . import attachflow, config, identity, jsonio, timing
+from .attachproc import AttachmentFlowProcessor
 from .caseproc import CaseProcessor
 from .identityproc import IdentityProcessor
 from .processor import JobProcessor
@@ -21,6 +22,7 @@ from .timeproc import TimingProcessor
 
 _UUID_RE = re.compile(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")
 _IDEMPOTENCY_RE = re.compile(r"^[\x21-\x7E]{8,200}$")
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 # 超过该嵌套深度的响应放弃缩进，改用紧凑 JSON（避免 O(深度²) 输出）
 _PRETTY_MAX_DEPTH = 500
@@ -114,6 +116,7 @@ class Handler(BaseHTTPRequestHandler):
     case_processor: CaseProcessor
     timing_processor: TimingProcessor
     identity_processor: IdentityProcessor
+    flow_processor: AttachmentFlowProcessor
     create_lock: threading.Lock
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -191,6 +194,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._list_analyses()
             elif path == "/api/v1/identity-checks":
                 self._list_identity_checks()
+            elif path == "/api/v1/attachment-flows":
+                self._list_attachment_flows()
             else:
                 match = re.fullmatch(r"/api/v1/jobs/([^/]+)", path)
                 if match:
@@ -262,6 +267,30 @@ class Handler(BaseHTTPRequestHandler):
                 if match:
                     self._get_identity_result(match.group(1))
                     return
+                match = re.fullmatch(
+                    r"/api/v1/attachment-flows/([^/]+)", path
+                )
+                if match:
+                    self._get_attachment_flow(match.group(1))
+                    return
+                match = re.fullmatch(
+                    r"/api/v1/attachment-flows/([^/]+)/events", path
+                )
+                if match:
+                    self._get_flow_events(match.group(1), query)
+                    return
+                match = re.fullmatch(
+                    r"/api/v1/attachment-flows/([^/]+)/attachments", path
+                )
+                if match:
+                    self._get_flow_attachments(match.group(1), query)
+                    return
+                match = re.fullmatch(
+                    r"/api/v1/attachment-flows/([^/]+)/result", path
+                )
+                if match:
+                    self._get_flow_result(match.group(1))
+                    return
                 self._error(404, "not_found", f"未知路径: {self.path}")
         except ApiError as exc:
             self._error(exc.status, exc.code, exc.message)
@@ -280,6 +309,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._create_analysis()
             elif path == "/api/v1/identity-checks":
                 self._create_identity_check()
+            elif path == "/api/v1/attachment-flows":
+                self._create_attachment_flow()
             else:
                 self._error(404, "not_found", f"未知路径: {self.path}")
         except ApiError as exc:
@@ -1146,6 +1177,261 @@ class Handler(BaseHTTPRequestHandler):
         download_name = f"{check['id']}.identity-result.json"
         self._file_download(Path(check["result_path"]), download_name)
 
+    # ------------------------------------------------- 附件流转追踪端点
+
+    def _public_flow(self, flow: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": flow["id"],
+            "status": flow["status"],
+            "created_at": flow["created_at"],
+            "updated_at": flow["updated_at"],
+            "target_type": flow["target_type"],
+            "target_id": flow["target_id"],
+            "progress": flow["progress"],
+            "phase": flow["phase"],
+            "error": flow["error"],
+            "email_count": flow["email_count"],
+            "event_count": flow["event_count"],
+            "review_count": flow["review_count"],
+            "stats": flow["stats"],
+        }
+
+    def _require_flow(self, flow_id: str) -> dict[str, Any]:
+        if not _UUID_RE.fullmatch(flow_id):
+            raise ApiError(400, "bad_request", "追踪 ID 格式非法")
+        flow = self.storage.get_attachment_flow(flow_id)
+        if flow is None:
+            raise ApiError(404, "not_found", f"附件流转追踪不存在: {flow_id}")
+        return flow
+
+    def _list_attachment_flows(self) -> None:
+        flows = self.storage.list_attachment_flows()
+        self._json(
+            200,
+            {"attachment_flows": [self._public_flow(f) for f in flows]},
+        )
+
+    def _create_attachment_flow(self) -> None:
+        content_type = self.headers.get("Content-Type", "")
+        if content_type.lower().split(";")[0].strip() != "application/json":
+            raise ApiError(
+                415,
+                "unsupported_media_type",
+                "创建附件流转追踪请使用 application/json 请求体",
+            )
+        body = self._read_body_capped()
+        if not body:
+            raise ApiError(400, "bad_request", "请求体为空")
+        try:
+            payload = jsonio.loads(body)
+        except Exception:
+            raise ApiError(400, "bad_request", "请求体不是合法 JSON")
+        if not isinstance(payload, dict):
+            raise ApiError(400, "bad_request", "请求体必须是 JSON 对象")
+
+        target_type = payload.get("target_type")
+        if target_type not in ("job", "case"):
+            raise ApiError(
+                400, "bad_request", "target_type 必须是 \"job\" 或 \"case\""
+            )
+        target_id = payload.get("target_id")
+        if not isinstance(target_id, str) or not _UUID_RE.fullmatch(target_id):
+            raise ApiError(400, "bad_request", "target_id 必须是作业/案件 UUID")
+        unknown = set(payload) - {"target_type", "target_id"}
+        if unknown:
+            raise ApiError(
+                400,
+                "bad_request",
+                "未知请求字段: " + ", ".join(sorted(unknown)),
+            )
+
+        with self.create_lock:
+            if target_type == "job":
+                target = self.storage.get_job(target_id)
+                label = "作业"
+            else:
+                target = self.storage.get_case(target_id)
+                label = "案件"
+            if target is None:
+                raise ApiError(
+                    404,
+                    "target_not_found",
+                    f"目标{label}不存在或已被删除: {target_id}",
+                )
+            if target["status"] != config.STATUS_COMPLETED:
+                raise ApiError(
+                    409,
+                    "target_not_completed",
+                    f"目标{label}未完成，不能创建附件流转追踪: {target_id} "
+                    f"(当前状态: {target['status']})",
+                )
+            flow_id = str(uuid.uuid4())
+            Storage.prepare_attachment_flow_dir(flow_id)
+            self.storage.create_attachment_flow(flow_id, target_type, target_id)
+
+        self.flow_processor.enqueue(flow_id)
+        flow = self.storage.get_attachment_flow(flow_id)
+        self._json(201, self._public_flow(flow))
+
+    def _get_attachment_flow(self, flow_id: str) -> None:
+        self._json(200, self._public_flow(self._require_flow(flow_id)))
+
+    def _completed_flow_result(
+        self, flow_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        flow = self._require_flow(flow_id)
+        if flow["status"] != config.STATUS_COMPLETED or not flow["result_path"]:
+            raise ApiError(
+                409,
+                "not_ready",
+                f"追踪尚未完成 (当前状态: {flow['status']})",
+            )
+        result = jsonio.loads(Path(flow["result_path"]).read_text("utf-8"))
+        return flow, result
+
+    def _flow_filters(
+        self, query: dict[str, list[str]]
+    ) -> tuple[str | None, int | None, str | None, str | None]:
+        """解析 ?type=&thread=&filename=&sha256= 筛选参数，非法值明确拒绝。"""
+        raw_type = query.get("type", [None])[0]
+        if raw_type is not None and raw_type not in attachflow.EVENT_TYPES:
+            raise ApiError(
+                400,
+                "bad_request",
+                f"未知事件类型: {raw_type!r}，可选: "
+                + ", ".join(attachflow.EVENT_TYPES),
+            )
+        raw_thread = query.get("thread", [None])[0]
+        thread_uid = None
+        if raw_thread is not None:
+            if not raw_thread.isdigit():
+                raise ApiError(
+                    400,
+                    "bad_request",
+                    "thread 筛选参数须为非负整数（会话根节点 uid）",
+                )
+            thread_uid = int(raw_thread)
+        raw_filename = query.get("filename", [None])[0]
+        if "filename" in query and (
+            raw_filename is None or not raw_filename.strip()
+        ):
+            raise ApiError(400, "bad_request", "filename 筛选参数不能为空")
+        raw_sha256 = query.get("sha256", [None])[0]
+        if raw_sha256 is not None:
+            if not _SHA256_RE.fullmatch(raw_sha256):
+                raise ApiError(
+                    400,
+                    "bad_request",
+                    "sha256 筛选参数须为 64 位十六进制字符串",
+                )
+            raw_sha256 = raw_sha256.lower()
+        return raw_type, thread_uid, raw_filename, raw_sha256
+
+    @staticmethod
+    def _match_event(
+        event: dict[str, Any],
+        ftype: str | None,
+        thread_uid: int | None,
+        filename: str | None,
+        sha256: str | None,
+    ) -> bool:
+        if ftype is not None and event["type"] != ftype:
+            return False
+        if thread_uid is not None and event["thread_root_uid"] != thread_uid:
+            return False
+        if filename is not None and filename not in (
+            event.get("filename"),
+            event.get("previous_filename"),
+        ):
+            return False
+        if sha256 is not None and sha256 not in (
+            event.get("sha256"),
+            event.get("previous_sha256"),
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _match_review(
+        review: dict[str, Any],
+        thread_uid: int | None,
+        filename: str | None,
+        sha256: str | None,
+    ) -> bool:
+        if thread_uid is not None and review["thread_root_uid"] != thread_uid:
+            return False
+        evidence = review.get("evidence") or {}
+        if filename is not None and evidence.get("filename") != filename:
+            return False
+        if sha256 is not None and evidence.get("sha256") != sha256:
+            return False
+        return True
+
+    def _get_flow_events(
+        self, flow_id: str, query: dict[str, list[str]]
+    ) -> None:
+        flow, result = self._completed_flow_result(flow_id)
+        ftype, thread_uid, filename, sha256 = self._flow_filters(query)
+        events = [
+            e
+            for e in result["events"]
+            if self._match_event(e, ftype, thread_uid, filename, sha256)
+        ]
+        # type 是事件专属维度：给出 type 时待复核项不参与（无事件类型）
+        if ftype is not None:
+            reviews: list[dict[str, Any]] = []
+        else:
+            reviews = [
+                r
+                for r in result["reviews"]
+                if self._match_review(r, thread_uid, filename, sha256)
+            ]
+        self._json(
+            200,
+            {
+                "flow_id": flow_id,
+                "target_type": flow["target_type"],
+                "target_id": flow["target_id"],
+                "filters": {
+                    "type": ftype,
+                    "thread": thread_uid,
+                    "filename": filename,
+                    "sha256": sha256,
+                },
+                "event_count": len(events),
+                "events": events,
+                "review_count": len(reviews),
+                "reviews": reviews,
+            },
+        )
+
+    def _get_flow_attachments(
+        self, flow_id: str, query: dict[str, list[str]]
+    ) -> None:
+        flow, result = self._completed_flow_result(flow_id)
+        _, _, filename, sha256 = self._flow_filters(query)
+        entries = result["attachments"]
+        if sha256 is not None:
+            entries = [e for e in entries if e["sha256"] == sha256]
+        if filename is not None:
+            entries = [e for e in entries if filename in e["names"]]
+        self._json(
+            200,
+            {
+                "flow_id": flow_id,
+                "target_type": flow["target_type"],
+                "target_id": flow["target_id"],
+                "filters": {"sha256": sha256, "filename": filename},
+                "attachment_count": len(entries),
+                "attachments": entries,
+            },
+        )
+
+    def _get_flow_result(self, flow_id: str) -> None:
+        flow, _ = self._completed_flow_result(flow_id)
+        download_name = f"{flow['id']}.flow-result.json"
+        self._file_download(Path(flow["result_path"]), download_name)
+
 
 def _compact_forest(
     roots: list[dict[str, Any]],
@@ -1288,6 +1574,7 @@ class ApiServer(ThreadingHTTPServer):
         self.case_processor = CaseProcessor(self.storage)
         self.timing_processor = TimingProcessor(self.storage)
         self.identity_processor = IdentityProcessor(self.storage)
+        self.flow_processor = AttachmentFlowProcessor(self.storage)
         self.create_lock = threading.Lock()
         # 注入给 Handler 实例使用
         Handler.storage = self.storage
@@ -1295,6 +1582,7 @@ class ApiServer(ThreadingHTTPServer):
         Handler.case_processor = self.case_processor
         Handler.timing_processor = self.timing_processor
         Handler.identity_processor = self.identity_processor
+        Handler.flow_processor = self.flow_processor
         Handler.create_lock = self.create_lock
 
     def start(self) -> None:
@@ -1303,12 +1591,14 @@ class ApiServer(ThreadingHTTPServer):
         self.case_processor.start()
         self.timing_processor.start()
         self.identity_processor.start()
+        self.flow_processor.start()
 
     def serve(self) -> None:
         self.processor.start()
         self.case_processor.start()
         self.timing_processor.start()
         self.identity_processor.start()
+        self.flow_processor.start()
         try:
             self.serve_forever()
         finally:
