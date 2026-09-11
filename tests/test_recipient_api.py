@@ -73,6 +73,24 @@ ORPHAN_EML = (
     b"Subject: orphan\r\nDate: Thu, 04 Sep 2026 09:00:00 +0000\r\n"
     b"In-Reply-To: <ghost@z.com>\r\nReferences: <ghost@z.com>\r\n\r\norphan"
 )
+# Message-ID 冲突：同 <conf@x.com>、内容不同的两个版本 + 引用它的回复
+CONF_V1_EML = (
+    b"Message-ID: <conf@x.com>\r\nFrom: A <a@x.com>\r\n"
+    b"To: B <b@x.com>, C <c@x.com>\r\nCc: D <d@x.com>\r\n"
+    b"Subject: conf v1\r\nDate: Fri, 05 Sep 2026 09:00:00 +0000\r\n\r\nv1"
+)
+CONF_V2_EML = (
+    b"Message-ID: <conf@x.com>\r\nFrom: P <p@x.com>\r\nTo: Q <q@x.com>\r\n"
+    b"Subject: conf v2 (different body)\r\n"
+    b"Date: Fri, 05 Sep 2026 09:00:00 +0000\r\n\r\nv2-different"
+)
+CONF_REPLY_EML = (
+    b"Message-ID: <conf-reply@x.com>\r\nFrom: B <b@x.com>\r\n"
+    b"To: A <a@x.com>, Z <z@x.com>\r\nSubject: Re: conf\r\n"
+    b"Date: Fri, 05 Sep 2026 10:00:00 +0000\r\n"
+    b"In-Reply-To: <conf@x.com>\r\n"
+    b"References: <conf@x.com>\r\n\r\nreply to ambiguous parent"
+)
 
 
 class RecipientFlowApiTest(unittest.TestCase):
@@ -145,6 +163,22 @@ class RecipientFlowApiTest(unittest.TestCase):
         self.assertEqual(status, 200, body)
         return headers, json.loads(body)
 
+    def _get_events_address(self, fid: str, address: str) -> list:
+        import urllib.parse
+
+        q = urllib.parse.quote(address, safe="")
+        _, body = self.get_json(
+            f"/api/v1/recipient-flows/{fid}/events?address={q}"
+        )
+        return body["events"]
+
+    @staticmethod
+    def _thread_event_ids(body: dict) -> set:
+        ids = set()
+        for thread in body["threads"]:
+            ids.update(e["id"] for e in thread["events"])
+        return ids
+
     # ------------------------------------------------------------ 用例
 
     def test_01_end_to_end_events_and_filters(self):
@@ -194,6 +228,35 @@ class RecipientFlowApiTest(unittest.TestCase):
         self.assertTrue(
             all(e["address"] == "carl@x.com" for e in body["events"])
         )
+
+        # address 归一化：域名大小写不敏感（dana@X.COM 等价 dana@x.com），
+        # /events 与 /threads 须命中相同地址；显示名形态也应被忽略
+        lower = self._get_events_address(fid, "dana@x.com")
+        upper = self._get_events_address(fid, "dana@X.COM")
+        named = self._get_events_address(fid, "Dana <dana@x.com>")
+        named_upper = self._get_events_address(fid, "Dana <dana@X.COM>")
+        self.assertEqual({e["id"] for e in lower},
+                         {e["id"] for e in upper})
+        self.assertEqual({e["id"] for e in lower},
+                         {e["id"] for e in named})
+        self.assertEqual({e["id"] for e in lower},
+                         {e["id"] for e in named_upper})
+        self.assertTrue(lower)
+        # /threads 同样按归一化地址命中
+        _, t_lower = self.get_json(
+            f"/api/v1/recipient-flows/{fid}/threads?address=dana@x.com"
+        )
+        _, t_upper = self.get_json(
+            f"/api/v1/recipient-flows/{fid}/threads?address=dana@X.COM"
+        )
+        self.assertEqual(
+            self._thread_event_ids(t_lower), self._thread_event_ids(t_upper)
+        )
+        # local-part 大小写不合并：Dana 不匹配 dana
+        _, body = self.get_json(
+            f"/api/v1/recipient-flows/{fid}/events?address=Dana@x.com"
+        )
+        self.assertEqual(body["event_count"], 0)
 
         # 会话筛选
         _, body = self.get_json(
@@ -329,6 +392,113 @@ class RecipientFlowApiTest(unittest.TestCase):
             f"/api/v1/recipient-flows/{fid}/events?type=added"
         )
         self.assertEqual(body["review_count"], 0)
+
+    def test_05b_reference_conflict_review_keeps_context(self):
+        """引用冲突：无客观事件；待复核附父子候选、会话根、字段、地址与集合。"""
+        job_id = self.create_completed_job({
+            "v1.eml": CONF_V1_EML, "v2.eml": CONF_V2_EML,
+            "reply.eml": CONF_REPLY_EML,
+        })
+        # 分析前后作业会话树不得被改写
+        _, before = self.get_json(f"/api/v1/jobs/{job_id}/tree")
+
+        done = self.completed_flow(job_id)
+        fid = done["id"]
+        # 冲突绝不产生客观事件
+        self.assertEqual(done["stats"]["events_total"], 0)
+        self.assertGreaterEqual(
+            done["stats"]["reviews_by_kind"]["reference_conflict"], 1
+        )
+
+        _, body = self.get_json(
+            f"/api/v1/recipient-flows/{fid}/events?kind=reference_conflict"
+        )
+        self.assertEqual(body["event_count"], 0)
+        # 找到引用方（reply.eml）的冲突待复核
+        review = next(
+            r for r in body["reviews"]
+            if r["kind"] == "reference_conflict"
+            and (r["email"].get("source") or {}).get("source_file")
+            == "reply.eml"
+        )
+        # 会话根 / 字段 / 子邮件
+        self.assertIsNotNone(review["thread_root_uid"])
+        for field in ("Message-ID", "In-Reply-To", "References",
+                      "From", "To", "Cc"):
+            self.assertIn(field, review["fields"])
+        self.assertEqual(
+            review["email"].get("source", {}).get("source_file"),
+            "reply.eml",
+        )
+        # 父节点不确定：不指向任一候选；两个候选并列保留
+        self.assertIsNone(review.get("parent_email"))
+        ev = review["evidence"]
+        self.assertEqual(ev["variant_count"], 2)
+        self.assertEqual(len(ev["variants"]), 2)
+        for variant in ev["variants"]:
+            self.assertIn("addresses", variant)
+            self.assertEqual(set(variant["sets"]), {"from", "to", "cc"})
+        addresses = {a for v in ev["variants"] for a in v["addresses"]}
+        self.assertEqual(
+            addresses,
+            {"a@x.com", "b@x.com", "c@x.com", "d@x.com", "p@x.com", "q@x.com"},
+        )
+        # 子邮件集合 + 按每个候选父邮件临时计算的差异
+        self.assertEqual(ev["sets"]["child"]["to"], ["a@x.com", "z@x.com"])
+        self.assertEqual(len(ev["candidate_differences"]), 2)
+        cand_sets = [
+            tuple(c["differences"]["reply_all_omitted"])
+            for c in ev["candidate_differences"]
+        ]
+        # 候选 v1（a→b,c 抄送 d）的差异：新增 z，遗漏 c、d
+        v1_diff = next(
+            c for c in ev["candidate_differences"]
+            if c["addresses"] == ["a@x.com", "b@x.com", "c@x.com", "d@x.com"]
+        )
+        self.assertEqual(v1_diff["differences"]["added"], ["z@x.com"])
+        self.assertEqual(
+            sorted(v1_diff["differences"]["reply_all_omitted"]),
+            ["c@x.com", "d@x.com"],
+        )
+        # 两个候选都给出了差异（并列，不做取舍）
+        self.assertEqual(
+            {frozenset(s) for s in cand_sets},
+            {frozenset(["c@x.com", "d@x.com"]),
+             frozenset(["p@x.com", "q@x.com"])},
+        )
+
+        # 地址筛选能命中冲突待复核（域名大小写归一化）
+        _, body_c = self.get_json(
+            f"/api/v1/recipient-flows/{fid}/events?address=c@X.COM"
+        )
+        self.assertTrue(
+            any(r["id"] == review["id"] for r in body_c["reviews"]),
+            "冲突待复核应可按候选差异中的地址（域名大小写不敏感）筛出",
+        )
+
+        # /threads 也内联该冲突待复核
+        _, threads = self.get_json(
+            f"/api/v1/recipient-flows/{fid}/threads?kind=reference_conflict"
+        )
+        review_ids = {
+            r["id"] for t in threads["threads"] for r in t["reviews"]
+        }
+        self.assertIn(review["id"], review_ids)
+
+        # 结果文件下载包含完整证据
+        status, _, raw = self.client.request(
+            "GET", f"/api/v1/recipient-flows/{fid}/result"
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(raw)
+        self.assertTrue(any(
+            r.get("evidence", {}).get("candidate_differences")
+            for r in result["reviews"]
+        ))
+
+        # 作业会话树未被分析改写
+        _, after = self.get_json(f"/api/v1/jobs/{job_id}/tree")
+        self.assertEqual(before, after)
 
     def test_06_creation_validation_and_listing(self):
         # 目标不存在

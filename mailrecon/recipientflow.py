@@ -164,7 +164,10 @@ def analyze(emails: list[dict[str, Any]]) -> dict[str, Any]:
         if is_noncanonical_dup:
             if mid in conflicted_mids:
                 add_review(
-                    _conflict_review(mail, mid, mid_groups[mid], own_dup=True),
+                    _conflict_review(
+                        mail, mid, mid_groups[mid], parsed_by_uid,
+                        own_dup=True, own_parsed=parsed,
+                    ),
                     row_review_ids,
                 )
                 skip_reason = "reference_conflict"
@@ -174,32 +177,47 @@ def analyze(emails: list[dict[str, Any]]) -> dict[str, Any]:
             if _claimed_refs(mail):
                 direct = _direct_ref(mail)
                 if direct in present_mids:
+                    candidate = by_uid[canonical_uid[direct]]
                     add_review(
-                        _edge_conflict_review(mail, direct), row_review_ids
+                        _edge_conflict_review(
+                            mail, direct, parsed,
+                            candidate, parsed_by_uid[candidate["uid"]],
+                        ),
+                        row_review_ids,
                     )
                 else:
                     add_review(
-                        _missing_parent_review(mail, direct), row_review_ids
+                        _missing_parent_review(mail, direct, parsed),
+                        row_review_ids,
                     )
-                skip_reason = "missing_parent"
+                skip_reason = "reference_conflict" if direct in present_mids \
+                    else "missing_parent"
             else:
                 skip_reason = "thread_root"
         else:
             direct = _direct_ref(mail)
             if direct is not None and parent.get("message_id") != direct:
                 if direct in present_mids:
+                    candidate = by_uid[canonical_uid[direct]]
                     add_review(
-                        _edge_conflict_review(mail, direct), row_review_ids
+                        _edge_conflict_review(
+                            mail, direct, parsed,
+                            candidate, parsed_by_uid[candidate["uid"]],
+                        ),
+                        row_review_ids,
                     )
+                    skip_reason = "reference_conflict"
                 else:
                     add_review(
-                        _missing_parent_review(mail, direct), row_review_ids
+                        _missing_parent_review(mail, direct, parsed),
+                        row_review_ids,
                     )
-                skip_reason = "missing_parent"
+                    skip_reason = "missing_parent"
             elif direct is not None and direct in conflicted_mids:
                 add_review(
                     _conflict_review(
-                        mail, direct, mid_groups[direct], own_dup=False
+                        mail, direct, mid_groups[direct], parsed_by_uid,
+                        own_dup=False, own_parsed=parsed,
                     ),
                     row_review_ids,
                 )
@@ -804,74 +822,183 @@ def _edge_background_review(
 
 
 def _missing_parent_review(
-    mail: dict[str, Any], direct: str | None
+    mail: dict[str, Any],
+    direct: str | None,
+    parsed: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "claimed_parent": direct,
+        "in_reply_to": mail.get("in_reply_to"),
+        "references": list(mail.get("references") or []),
+    }
+    if parsed is not None:
+        # 子邮件（声称回复方）自身的可见地址集合，便于与日后补齐的父邮件核对
+        evidence["child_email"] = _mail_ref(mail)
+        evidence["addresses"] = sorted(parsed["participants"])
+        evidence["sets"] = {"child": _address_set_view(parsed)}
     return _review(
         mail,
         "missing_parent",
         f"邮件声称回复 {direct or '(未知父标识)'}，但父邮件不在目标范围内"
         "（缺失或挂载到上溯祖先），无法比较收件人流转，仅列为待复核",
-        {
-            "claimed_parent": direct,
-            "in_reply_to": mail.get("in_reply_to"),
-            "references": list(mail.get("references") or []),
-        },
+        evidence,
         fields=["In-Reply-To", "References"],
     )
 
 
 def _edge_conflict_review(
-    mail: dict[str, Any], direct: str | None
+    mail: dict[str, Any],
+    direct: str | None,
+    parsed: dict[str, Any] | None = None,
+    candidate: dict[str, Any] | None = None,
+    candidate_parsed: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """引用边被断开（成环/自引用/重复未挂载）的待复核。
+
+    当声称的直接父 Message-ID 对应邮件可定位（``candidate``）时，附上
+    候选父邮件、两封邮件的地址集合与按该候选计算的集合差异，但**不据此
+    选择父节点、不生成客观事件**，仅便于人工核对。
+    """
+    evidence: dict[str, Any] = {
+        "claimed_parent": direct,
+        "in_reply_to": mail.get("in_reply_to"),
+        "references": list(mail.get("references") or []),
+    }
+    if parsed is not None:
+        evidence["addresses"] = sorted(parsed["participants"])
+        evidence["sets"] = {"child": _address_set_view(parsed)}
+    if candidate is not None and candidate_parsed is not None and parsed is not None:
+        provisional = _diff_sets(candidate_parsed, parsed)
+        evidence["parent_email"] = _mail_ref(candidate)
+        evidence["sets"] = {
+            "child": _address_set_view(parsed),
+            "parent_candidate": _address_set_view(candidate_parsed),
+        }
+        evidence["provisional_differences"] = _difference_block(provisional)
+        evidence["provisional_note"] = (
+            "以下集合差异按声称的直接父邮件（引用边已断开）临时计算，"
+            "不代表确定的父子关系，不生成客观事件，仅供人工复核"
+        )
     return _review(
         mail,
         "reference_conflict",
         f"邮件声称的直接父邮件 {direct or '(未知父标识)'} 引用边被断开"
         "（引用成环/自引用或重复邮件未参与挂载），无法可靠确定父节点，"
         "收件人流转差异仅列为待复核",
-        {
-            "claimed_parent": direct,
-            "in_reply_to": mail.get("in_reply_to"),
-            "references": list(mail.get("references") or []),
-        },
-        fields=["In-Reply-To", "References"],
+        evidence,
+        fields=["Message-ID", "In-Reply-To", "References", "From", "To", "Cc"],
     )
+
+
+def _address_set_view(parsed: dict[str, Any]) -> dict[str, Any]:
+    """一封邮件 From/To/Cc 可见地址集合（用于待复核证据，不含显示名）。"""
+    return {
+        "from": sorted(parsed["from_map"]),
+        "to": sorted(parsed["role_map"]["to"]),
+        "cc": sorted(parsed["role_map"]["cc"]),
+    }
+
+
+def _difference_block(diff: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "added": diff["added"],
+        "dropped": diff["dropped"],
+        "role_changed": diff["role_changed"],
+        "reply_all_omitted": diff["reply_all_omitted"],
+    }
+
+
+def _parent_candidate(
+    candidate: dict[str, Any], candidate_parsed: dict[str, Any]
+) -> dict[str, Any]:
+    """冲突候选父邮件的并列展示单元（含地址集合，供人工核对，不做取舍）。"""
+    return {
+        "uid": candidate["uid"],
+        "message_id": candidate.get("message_id"),
+        "date": candidate.get("date"),
+        "subject": candidate.get("subject"),
+        "source": candidate["source"],
+        "raw_sha256": candidate.get("raw_sha256"),
+        "addresses": sorted(candidate_parsed["participants"]),
+        "sets": _address_set_view(candidate_parsed),
+    }
 
 
 def _conflict_review(
     mail: dict[str, Any],
     conflicted_mid: str,
     group: list[dict[str, Any]],
+    parsed_by_uid: dict[int, dict[str, Any]],
     own_dup: bool,
+    own_parsed: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Message-ID 冲突待复核。
+
+    * ``own_dup=True``：本邮件自身的 ID 被多封内容不同的邮件复用
+      （``group`` 即共享该 ID 的全部邮件，本邮件在其中）；
+    * ``own_dup=False``：本邮件声称回复的父 ID 对应多封内容不同的邮件
+      （``group`` 为候选父邮件）。
+
+    两种形态都并列展示冲突各方的地址集合；声称回复的形态还按每个候选
+    父邮件临时计算集合差异（``candidate_differences``），但**不选择父
+    节点、不生成客观事件、不改写会话树**。
+    """
     variants = [
-        {"uid": m["uid"], "raw_sha256": m.get("raw_sha256"),
-         "source": m["source"]}
+        _parent_candidate(m, parsed_by_uid[m["uid"]])
         for m in sorted(group, key=lambda m: m["uid"])
     ]
+    evidence: dict[str, Any] = {
+        "message_id": conflicted_mid,
+        "variant_count": len(variants),
+        "variants": variants,
+    }
     if own_dup:
         summary = (
             f"邮件的 Message-ID {conflicted_mid} 被 {len(group)} 封内容不同"
             "的邮件复用，本邮件不是规范节点，会话位置无法确定，收件人流转"
             "差异仅列为待复核"
         )
+        if own_parsed is not None:
+            evidence["addresses"] = sorted(own_parsed["participants"])
+            evidence["sets"] = {"child": _address_set_view(own_parsed)}
     else:
         summary = (
             f"邮件声称回复的 Message-ID {conflicted_mid} 对应 "
             f"{len(group)} 封内容不同的邮件，父节点不确定，收件人流转差异"
             "仅列为待复核"
         )
-    return _review(
+        if own_parsed is not None:
+            provisional = []
+            for candidate in sorted(group, key=lambda m: m["uid"]):
+                cand_parsed = parsed_by_uid[candidate["uid"]]
+                diff = _diff_sets(cand_parsed, own_parsed)
+                provisional.append(
+                    {
+                        "parent_uid": candidate["uid"],
+                        "parent_message_id": candidate.get("message_id"),
+                        "addresses": sorted(cand_parsed["participants"]),
+                        "differences": _difference_block(diff),
+                    }
+                )
+            evidence["addresses"] = sorted(own_parsed["participants"])
+            evidence["sets"] = {"child": _address_set_view(own_parsed)}
+            evidence["candidate_differences"] = provisional
+            evidence["provisional_note"] = (
+                "candidate_differences 分别按每个候选父邮件临时计算，"
+                "候选之间不做取舍；不生成客观事件，仅供人工复核"
+            )
+    review = _review(
         mail,
         "reference_conflict",
         summary,
-        {
-            "message_id": conflicted_mid,
-            "variant_count": len(variants),
-            "variants": variants,
-        },
-        fields=["Message-ID", "In-Reply-To", "References"],
+        evidence,
+        fields=["Message-ID", "In-Reply-To", "References", "From", "To", "Cc"],
     )
+    # 声称回复的形态可定位候选父邮件（并列、不选择）；自身冲突形态没有
+    # 唯一父节点，parent_email 置 null
+    if not own_dup and group:
+        review["parent_email"] = None
+    return review
 
 
 # ================================================================ 边/台账/会话

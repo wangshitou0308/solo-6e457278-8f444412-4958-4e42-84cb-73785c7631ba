@@ -1060,7 +1060,7 @@ GET /api/v1/recipient-flows/{flow_id}/events?kind=possible_mailing_list
 | `type` | 事件类型，须为 `added` / `dropped` / `role_changed` / `reply_all_omitted`，未知值返回 400；给出 `type` 时只返回事件、不返回待复核项 |
 | `kind` | 待复核类型，须为 `possible_mailing_list` / `malformed_address` / `missing_parent` / `reference_conflict`，未知值返回 400 |
 | `thread` | 会话根节点 uid（非负整数） |
-| `address` | 完整邮箱地址（`local-part@domain`）；与引擎同口径匹配（域名小写、local-part 原样），非法形态返回 400。事件按其**主地址**匹配（即该条差异针对的地址），待复核按差异清单/畸形地址/列表提示中的地址匹配 |
+| `address` | 完整邮箱地址（`local-part@domain`，也接受 `显示名 <local-part@domain>` 形态，显示名忽略）；与引擎同口径匹配（**域名转小写、local-part 保持原样**，因此 `dana@X.COM` 与 `dana@x.com` 命中相同结果，而 `Dana@x.com` 不匹配 `dana@x.com`），非法形态返回 400。事件按其**主地址**匹配（即该条差异针对的地址），待复核按差异清单/畸形地址/冲突候选集合中的地址匹配。`/events` 与 `/threads` 使用同一归一化口径 |
 
 参数可组合。响应顶层同时给出 `events`（客观事件）与 `reviews`
 （待复核项），各带 `event_count` / `review_count` 与回显的 `filters`。
@@ -1131,6 +1131,21 @@ GET /api/v1/recipient-flows/{flow_id}/events?kind=possible_mailing_list
 会话根与 `evidence`：邮件级背景（列表/畸形）挂在对应邮件上；
 父子边背景（`evidence.background_kinds`、`evidence.sets`）挂在子邮件上，
 其中集合差异快照与事件口径一致，便于人工复核。
+
+`reference_conflict`（Message-ID 对应多封内容不同的邮件、引用边断开）
+不生成客观事件，但其待复核记录保留核对集合差异所需的全部上下文：
+
+* `email` 为声称回复的子邮件（含 uid、Message-ID、来源）；父节点不
+  唯一/无法确定时 `parent_email` 为 `null`，候选父邮件**并列**保留在
+  `evidence.variants` 中（每个候选含 uid、来源、`addresses` 与
+  from/to/cc 的 `sets`），不做取舍；
+* `evidence.sets.child` 给子邮件自身的 from/to/cc 集合；
+  `evidence.candidate_differences` 按每个候选父邮件分别给出
+  `added` / `dropped` / `role_changed` / `reply_all_omitted`
+  （临时计算，附 `provisional_note` 说明不代表确定父子关系）；
+* 引用边断开但声称的直接父可定位时，`evidence.parent_email` 指向该
+  候选，集合差异放在 `evidence.provisional_differences`，
+  `sets.parent_candidate` 给候选父集合。冲突分析全程不改写会话树。
 
 ## 24. 按会话 / 地址台账查询
 

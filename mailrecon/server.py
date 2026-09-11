@@ -7,6 +7,7 @@ import re
 import threading
 import uuid
 from datetime import datetime
+from email.utils import getaddresses
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -1609,9 +1610,12 @@ class Handler(BaseHTTPRequestHandler):
             raw_address is None or not raw_address.strip()
         ):
             raise ApiError(400, "bad_request", "address 筛选参数不能为空")
+        address_key = None
         if raw_address is not None:
-            raw_address = raw_address.strip()
-            if _address_filter_key(raw_address) is None:
+            # 与引擎同一规则：忽略显示名（支持 "Name <a@x>" 形态），
+            # 域名转小写、local-part 保持原样；dana@X.COM 归一为 dana@x.com
+            address_key = _address_filter_key(raw_address.strip())
+            if address_key is None:
                 raise ApiError(
                     400,
                     "bad_request",
@@ -1625,7 +1629,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"未知待复核类型: {raw_kind!r}，可选: "
                 + ", ".join(recipientflow.REVIEW_KINDS),
             )
-        return raw_type, thread_uid, raw_address, raw_kind
+        return raw_type, thread_uid, address_key, raw_kind
 
     @staticmethod
     def _event_mentions_address(event: dict[str, Any], address: str) -> bool:
@@ -1648,20 +1652,14 @@ class Handler(BaseHTTPRequestHandler):
         ):
             if _address_filter_key(cell.get("raw_address", "")) == address:
                 return True
-        # 父子边背景待复核：地址须出现在差异清单（而非全集快照）中
-        differences = (evidence.get("sets") or {}).get("differences")
-        if differences is not None:
-            for key, addrs in differences.items():
-                if key == "role_changed":
-                    if any(
-                        isinstance(c, dict) and c.get("address") == address
-                        for c in addrs
-                    ):
-                        return True
-                elif address in addrs:
-                    return True
+        # 集合类证据（边背景差异、冲突候选差异、候选/子邮件地址集合）
+        if _evidence_sets_mention(evidence, address):
+            return True
         # 邮件级列表迹象：提示文本中精确出现该地址 token
-        if any(address in _address_tokens(hint) for hint in evidence.get("hints", []) or []):
+        if any(
+            address in _address_tokens(hint)
+            for hint in evidence.get("hints", []) or []
+        ):
             return True
         return False
 
@@ -1923,25 +1921,99 @@ def _parse_thresholds(raw: Any) -> dict[str, int]:
 
 
 def _address_filter_key(raw: str) -> str | None:
-    """筛选地址归一化：与收件人引擎同口径（域名小写、local-part 原样）。
+    """筛选地址归一化：与收件人引擎同口径。
 
-    形态无法可靠归一化时返回 None（调用方按 400 处理）。
+    忽略显示名（``Dana <dana@x.com>`` 取 ``dana@x.com``），只把域名转
+    小写、local-part 保持原样，因此 ``dana@X.COM`` 与 ``dana@x.com``
+    得到同一键，而 ``Dana@x.com`` 与 ``dana@x.com`` 不合并。形态无法
+    可靠归一化时返回 None（调用方按 400 处理）。
     """
-    if not raw or raw.count("@") != 1 or any(ch.isspace() for ch in raw):
+    if not raw:
         return None
-    local, domain = raw.split("@")
+    # 用标准库剥离显示名/尖括号；多个地址的筛选值不做猜测，返回 None
+    pairs = getaddresses([raw])
+    addrs = [addr for _, addr in pairs if addr]
+    if len(addrs) != 1:
+        return None
+    spec = addrs[0].strip()
+    if spec.count("@") != 1 or any(ch.isspace() for ch in spec):
+        return None
+    local, domain = spec.split("@")
     if not local or not domain or local.startswith('"'):
         return None
-    if any(
+    labels = domain.split(".")
+    # 与引擎 _normalize 同口径：域名至少含一个点，标签非空、≤63 字符、
+    # 不以连字符开头/结尾
+    if len(labels) < 2 or any(
         not label or len(label) > 63
         or label.startswith("-") or label.endswith("-")
-        for label in domain.split(".")
+        for label in labels
     ):
         return None
     return f"{local}@{domain.lower()}"
 
 
 _ADDR_TOKEN_RE = re.compile(r"[^\s,;()]+@[^\s,;()]+")
+
+
+def _difference_block_mentions(block: Any, address: str) -> bool:
+    """差异清单（added/dropped/role_changed/reply_all_omitted）是否涉及地址。"""
+    if not isinstance(block, dict):
+        return False
+    for key, addrs in block.items():
+        if key == "role_changed":
+            if isinstance(addrs, list) and any(
+                isinstance(c, dict) and c.get("address") == address
+                for c in addrs
+            ):
+                return True
+        elif isinstance(addrs, list) and address in addrs:
+            return True
+    return False
+
+
+def _set_view_mentions(view: Any, address: str) -> bool:
+    """from/to/cc 集合视图是否包含地址。"""
+    return isinstance(view, dict) and any(
+        isinstance(addrs, list) and address in addrs
+        for addrs in view.values()
+    )
+
+
+def _evidence_sets_mention(evidence: dict[str, Any], address: str) -> bool:
+    """待复核证据中的集合/差异是否针对某地址。
+
+    覆盖边背景（``sets.differences``）、引用冲突（``variants[*]`` 的
+    地址集合、``candidate_differences``、``provisional_differences``）、
+    父链缺失（``sets.child``、``addresses``）。
+    """
+    sets = evidence.get("sets")
+    if isinstance(sets, dict):
+        differences = sets.get("differences")
+        if _difference_block_mentions(differences, address):
+            return True
+        for view_key in ("child", "parent", "parent_candidate"):
+            if _set_view_mentions(sets.get(view_key), address):
+                return True
+    if isinstance(evidence.get("addresses"), list) and address in evidence["addresses"]:
+        return True
+    provisional = evidence.get("provisional_differences")
+    if _difference_block_mentions(provisional, address):
+        return True
+    for cand in evidence.get("candidate_differences", []) or []:
+        if isinstance(cand, dict):
+            if isinstance(cand.get("addresses"), list) and address in cand["addresses"]:
+                return True
+            if _difference_block_mentions(cand.get("differences"), address):
+                return True
+    for variant in evidence.get("variants", []) or []:
+        if not isinstance(variant, dict):
+            continue
+        if isinstance(variant.get("addresses"), list) and address in variant["addresses"]:
+            return True
+        if _set_view_mentions(variant.get("sets"), address):
+            return True
+    return False
 
 
 def _address_tokens(text: str) -> set[str]:

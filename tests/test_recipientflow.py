@@ -6,6 +6,7 @@ import unittest
 
 import tests.support  # noqa: F401
 from mailrecon import recipientflow
+from mailrecon.server import _address_filter_key
 
 
 def addr(value, name=""):
@@ -223,6 +224,105 @@ class ReviewTest(unittest.TestCase):
             all(r["kind"] == "reference_conflict" for r in out["reviews"])
         )
 
+    def test_conflict_review_keeps_child_parent_sets_and_addresses(self):
+        """引用冲突待复核：保留子邮件、候选父邮件、会话根、字段、地址与集合差异。"""
+        v1 = mail(0, addr("a@x.com"),
+                  [addr("b@x.com"), addr("c@x.com")], cc=[addr("d@x.com")],
+                  mid="<conf@x.com>", raw="sha-1", root_uid=0)
+        v2 = mail(1, addr("p@x.com"), [addr("q@x.com")],
+                  mid="<conf@x.com>", raw="sha-2", root_uid=1)
+        child = reply(2, v1, frm=addr("b@x.com"),
+                      to=[addr("a@x.com"), addr("z@x.com")],
+                      mid="<child@x.com>")
+        out = recipientflow.analyze([v1, v2, child])
+        # 冲突绝不产生客观事件
+        self.assertEqual(out["events"], [])
+        review = next(
+            r for r in out["reviews"]
+            if r["kind"] == "reference_conflict" and r["email"]["uid"] == 2
+        )
+        # 会话根
+        self.assertEqual(review["thread_root_uid"], 0)
+        self.assertEqual(review["thread_root_message_id"], "<m0@x.com>")
+        # 涉及字段含引用字段与可见地址字段
+        for field in ("Message-ID", "In-Reply-To", "References",
+                      "From", "To", "Cc"):
+            self.assertIn(field, review["fields"])
+        ev = review["evidence"]
+        # 子邮件（声称回复方）地址与集合
+        self.assertEqual(ev["addresses"], ["a@x.com", "b@x.com", "z@x.com"])
+        self.assertEqual(ev["sets"]["child"], {
+            "from": ["b@x.com"],
+            "to": ["a@x.com", "z@x.com"],
+            "cc": [],
+        })
+        # 父节点不确定 -> parent_email 不指向任一候选，候选并列保留
+        self.assertIsNone(review.get("parent_email"))
+        self.assertEqual(len(ev["variants"]), 2)
+        for variant in ev["variants"]:
+            self.assertIn("addresses", variant)
+            self.assertEqual(set(variant["sets"]), {"from", "to", "cc"})
+        by_uid = {v["uid"]: v for v in ev["variants"]}
+        self.assertEqual(
+            by_uid[0]["addresses"], ["a@x.com", "b@x.com", "c@x.com", "d@x.com"]
+        )
+        self.assertEqual(by_uid[1]["addresses"], ["p@x.com", "q@x.com"])
+        # 每个候选父邮件都附临时集合差异（不做取舍）
+        cand = {c["parent_uid"]: c for c in ev["candidate_differences"]}
+        self.assertEqual(set(cand), {0, 1})
+        diff0 = cand[0]["differences"]
+        self.assertEqual(diff0["added"], ["z@x.com"])
+        self.assertEqual(
+            sorted(diff0["reply_all_omitted"]), ["c@x.com", "d@x.com"]
+        )
+        self.assertIn("provisional_note", ev)
+        # 邮件行：冲突边不参与比较
+        row = next(r for r in out["emails"] if r["uid"] == 2)
+        self.assertFalse(row["compared"])
+        self.assertEqual(row["skip_reason"], "reference_conflict")
+
+    def test_edge_broken_conflict_keeps_provisional_sets(self):
+        """引用边断开但声称的父邮件可定位：候选父、地址集合与临时差异并列待复核。
+
+        构造：本邮件 In-Reply-To 指向包内另一封邮件（候选父），但其引用边
+        被断开（这里用自引用成环：threads 把自引用边断开后本邮件独立成根，
+        parent_uid=None，声称的直接父即其自身、在范围内）。此时不落客观
+        事件，候选父的地址集合与临时差异一并列入待复核。
+        """
+        mail0 = mail(0, addr("a@x.com"),
+                     [addr("b@x.com"), addr("c@x.com")],
+                     mid="<self@x.com>", parent_uid=None,
+                     irt="<self@x.com>", refs=["<self@x.com>"], root_uid=0)
+        # 手工赋予“成环断开后按自身可见地址计算”的子邮件内容：
+        # b 回复，新增 z，遗漏 c
+        mail0["from"] = addr("b@x.com")
+        mail0["to"] = [addr("a@x.com"), addr("z@x.com")]
+        out = recipientflow.analyze([mail0])
+        self.assertEqual(out["events"], [])
+        review = next(r for r in out["reviews"]
+                      if r["kind"] == "reference_conflict")
+        ev = review["evidence"]
+        # 候选父就是其声称的 <self@x.com>（uid 0）
+        self.assertEqual(ev["parent_email"]["uid"], 0)
+        self.assertEqual(ev["sets"]["child"]["to"], ["a@x.com", "z@x.com"])
+        self.assertIn("parent_candidate", ev["sets"])
+        self.assertIn("provisional_differences", ev)
+        self.assertIn("provisional_note", ev)
+
+    def test_analysis_does_not_mutate_inputs(self):
+        """分析只读输入，不改写会话树/邮件数据（回归）。"""
+        import copy
+        root = mail(0, addr("a@x.com"), [addr("b@x.com")],
+                    mid="<conf@x.com>", raw="sha-1", root_uid=0)
+        dup = mail(1, addr("c@x.com"), [addr("b@x.com")],
+                   mid="<conf@x.com>", raw="sha-2", root_uid=1)
+        child = reply(2, root, frm=addr("b@x.com"),
+                      to=[addr("a@x.com"), addr("z@x.com")],
+                      mid="<child@x.com>")
+        snapshot = copy.deepcopy([root, dup, child])
+        recipientflow.analyze([root, dup, child])
+        self.assertEqual([root, dup, child], snapshot)
+
     def test_self_reference_is_conflict(self):
         loop = mail(0, addr("a@x.com"), [addr("b@x.com")],
                     mid="<self@x.com>", irt="<self@x.com>",
@@ -365,6 +465,42 @@ class RegistryAndStatsTest(unittest.TestCase):
         )
         self.assertEqual(stats["reviews_by_kind"]["missing_parent"], 1)
         self.assertEqual(stats["threads_total"], 2)
+
+
+class FilterKeyTest(unittest.TestCase):
+    """接口 address 参数的归一化规则（/events 与 /threads 共用）。"""
+
+    def test_domain_lowercased_local_preserved(self):
+        self.assertEqual(
+            _address_filter_key("dana@X.COM"), "dana@x.com"
+        )
+        self.assertEqual(
+            _address_filter_key("dana@x.com"), "dana@x.com"
+        )
+        # local-part 保持原样：Dana 不等于 dana
+        self.assertEqual(
+            _address_filter_key("Dana@x.com"), "Dana@x.com"
+        )
+        self.assertNotEqual(
+            _address_filter_key("Dana@x.com"),
+            _address_filter_key("dana@x.com"),
+        )
+
+    def test_display_name_ignored(self):
+        self.assertEqual(
+            _address_filter_key("Dana <dana@X.COM>"), "dana@x.com"
+        )
+        quoted = '"Dana Person" <dana@x.com>'
+        self.assertEqual(_address_filter_key(quoted), "dana@x.com")
+
+    def test_invalid_returns_none(self):
+        for bad in ("", "not-an-email", "a@x", "@x.com",
+                    "a b@x.com", "a@x..com", "a@.com"):
+            self.assertIsNone(_address_filter_key(bad), bad)
+        # 含多个地址不作为单个筛选键
+        self.assertIsNone(_address_filter_key("a@x.com, b@x.com"))
+        # getaddresses 容错拆分为多段的畸形值也不接受
+        self.assertIsNone(_address_filter_key("a@x com"))
 
 
 if __name__ == "__main__":
