@@ -313,3 +313,95 @@ curl -s -X DELETE "$BASE/api/v1/jobs/$LB" > /dev/null
 curl -s "$BASE/api/v1/identity-checks/$ICC/result" | python3 -c \
   "import json,sys; r=json.load(sys.stdin); print('核验结果仍可读, 发现数:', r['stats']['findings_total'])"
 
+# ================================================================ 收件人流转分析
+# 前置：python3 scripts/make_recipient_sample.py 生成
+#   examples/recipient-mails.zip        四类事件 + 列表/畸形/父缺失待复核
+#   examples/recipient-case-{a,b}.zip   跨包补链父子边（案件级 reply-all 遗漏）
+
+# ---------------------------------------------------------------- 26. 上传示例包并创建收件人流转分析
+RFJOB=$(curl -s -X POST "$BASE/api/v1/jobs" \
+  -F 'file=@examples/recipient-mails.zip;type=application/zip' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+while :; do
+  S=$(curl -s "$BASE/api/v1/jobs/$RFJOB" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+  [ "$S" = completed ] && break
+  [ "$S" = failed ] && { echo "作业失败: $RFJOB"; exit 1; }
+  sleep 0.5
+done
+RF_JSON=$(curl -s -X POST "$BASE/api/v1/recipient-flows" \
+  -H 'Content-Type: application/json' \
+  -d "{\"target_type\": \"job\", \"target_id\": \"$RFJOB\"}")
+echo "$RF_JSON"
+RF=$(python3 -c "import json,sys; print(json.load(sys.stdin.read())['id'])" <<<"$RF_JSON")
+
+# ---------------------------------------------------------------- 27. 轮询分析进度
+while :; do
+  RFSTAT=$(curl -s "$BASE/api/v1/recipient-flows/$RF")
+  STATUS=$(python3 -c "import json,sys; print(json.load(sys.stdin)['status'])" <<<"$RFSTAT")
+  echo "$RFSTAT" | python3 -c "import json,sys; j=json.load(sys.stdin); print(j['status'], j['progress'], j['phase'])"
+  [ "$STATUS" = completed ] || [ "$STATUS" = failed ] || { sleep 0.5; continue; }
+  break
+done
+# events_by_type / reviews_by_kind：四类事件与四类待复核计数
+echo "$RFSTAT" | python3 -m json.tool
+
+# ---------------------------------------------------------------- 28. 读取事件并按类型/会话/地址/待复核筛选
+# 全部事件 + 待复核项（events + reviews，各带计数与回显 filters）
+curl -s "$BASE/api/v1/recipient-flows/$RF/events" | python3 -m json.tool
+# 只看疑似 reply-all 遗漏
+curl -s "$BASE/api/v1/recipient-flows/$RF/events?type=reply_all_omitted" | python3 -m json.tool
+# 按会话根 uid 筛选
+curl -s "$BASE/api/v1/recipient-flows/$RF/events?thread=0" | python3 -m json.tool
+# 按地址筛选：只返回针对该地址的差异（域名大小写不敏感、local-part 原样）
+curl -s "$BASE/api/v1/recipient-flows/$RF/events?address=carl@example.org" | python3 -m json.tool
+# 只看待复核（如邮件列表/群组迹象）；边级待复核的 evidence.sets 仍附集合差异
+curl -s "$BASE/api/v1/recipient-flows/$RF/events?kind=possible_mailing_list" | python3 -m json.tool
+# 未知 type/kind、非法 address/thread 返回 400
+curl -s "$BASE/api/v1/recipient-flows/$RF/events?type=bogus"; echo
+
+# ---------------------------------------------------------------- 29. 按会话 / 地址台账
+curl -s "$BASE/api/v1/recipient-flows/$RF/threads" | python3 -m json.tool
+curl -s "$BASE/api/v1/recipient-flows/$RF/threads?address=erin@example.org" | python3 -m json.tool
+# 地址台账：每个归一化地址的显示名、出现字段与全部出现位置
+curl -s "$BASE/api/v1/recipient-flows/$RF/addresses" | python3 -m json.tool
+
+# ---------------------------------------------------------------- 30. 下载结果 JSON（独立持久化）
+curl -s -D - "$BASE/api/v1/recipient-flows/$RF/result" -o "/tmp/${RF}.recipient-flow-result.json"
+python3 -m json.tool "/tmp/${RF}.recipient-flow-result.json" | head -40 || true
+
+# ---------------------------------------------------------------- 31. 案件级：跨包补链父子边上的 reply-all 遗漏 + 删除源数据后仍可读
+RA=$(curl -s -X POST "$BASE/api/v1/jobs" -F 'file=@examples/recipient-case-a.zip;type=application/zip' | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+RB=$(curl -s -X POST "$BASE/api/v1/jobs" -F 'file=@examples/recipient-case-b.zip;type=application/zip' | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+for J in "$RA" "$RB"; do
+  while :; do
+    S=$(curl -s "$BASE/api/v1/jobs/$J" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+    [ "$S" = completed ] && break
+    [ "$S" = failed ] && { echo "作业失败: $J"; exit 1; }
+    sleep 0.5
+  done
+done
+RFCASE=$(curl -s -X POST "$BASE/api/v1/cases" -H 'Content-Type: application/json' \
+  -d "{\"name\": \"跨包收件人流转\", \"job_ids\": [\"$RA\", \"$RB\"]}" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+while :; do
+  S=$(curl -s "$BASE/api/v1/cases/$RFCASE" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+  [ "$S" = completed ] && break
+  sleep 0.5
+done
+RFC=$(curl -s -X POST "$BASE/api/v1/recipient-flows" -H 'Content-Type: application/json' \
+  -d "{\"target_type\": \"case\", \"target_id\": \"$RFCASE\"}" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+while :; do
+  S=$(curl -s "$BASE/api/v1/recipient-flows/$RFC" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+  [ "$S" = completed ] && break
+  sleep 0.5
+done
+# 跨包补链的父子边上，carol / david 被标记为 reply_all_omitted
+curl -s "$BASE/api/v1/recipient-flows/$RFC/events?type=reply_all_omitted" | python3 -m json.tool
+# 删除源作业与案件：分析结果仍可下载
+curl -s -X DELETE "$BASE/api/v1/jobs/$RA" > /dev/null
+curl -s -X DELETE "$BASE/api/v1/jobs/$RB" > /dev/null
+curl -s "$BASE/api/v1/recipient-flows/$RFC/result" | python3 -c \
+  "import json,sys; r=json.load(sys.stdin); print('收件人流转结果仍可读, 事件数:', r['stats']['events_total'])"
+
+

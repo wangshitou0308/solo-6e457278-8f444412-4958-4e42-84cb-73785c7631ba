@@ -912,6 +912,277 @@ Content-Disposition: attachment; filename="<check_id>.identity-result.json"
 核验完成后删除源作业/案件不影响结果的读取与下载；服务重启后，未完成的
 核验会自动重新入队处理。
 
+## 21. 创建收件人流转分析
+
+```
+POST /api/v1/recipient-flows
+Content-Type: application/json
+```
+
+对一个**已完成**的作业或案件做收件人流转分析。分析沿会话树的每一条
+父子回复边，逐条比较两封邮件的 **From / To / Cc 可见地址集合**，在后台
+运行并把结果独立落盘。
+
+**匹配规则**：
+
+* **忽略显示名**：只用 `local-part@domain` 比较，显示名（`张三`、
+  `Alice` 等）完全不参与；
+* **域名转小写，local-part 保持原样**：`a@X.com` 与 `a@x.com` 视为
+  同一地址；`John@x.com` 与 `john@x.com` **不**合并（不猜测 local-part
+  的大小写语义）；
+* 同一封邮件 To/Cc 中重复出现的地址按集合去重，但地址台账保留全部出现。
+
+**离线边界（重要）**：只比较邮件头中**可见**的 From/To/Cc。**绝不读取
+或推断 Bcc**，不使用 Sender / Return-Path / Received 等 **SMTP 信封**
+信息猜测谁真正收到，不查 DNS；分析只读结果 JSON，**绝不改写现有会话树**。
+
+**请求体**
+
+```json
+{
+  "target_type": "job",
+  "target_id": "<已完成作业或案件的UUID>"
+}
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `target_type` | 是 | `"job"` 或 `"case"` |
+| `target_id` | 是 | 目标作业/案件 UUID |
+
+无阈值参数；出现未知字段返回 `400 bad_request`。
+
+**响应** `201 Created`：
+
+```json
+{
+  "id": "7b86e437-99d0-480d-be4d-860bd6bcdb83",
+  "status": "queued",
+  "created_at": "2026-09-11T09:00:00+00:00",
+  "updated_at": "2026-09-11T09:00:00+00:00",
+  "target_type": "job",
+  "target_id": "a0816b74-...",
+  "progress": 0,
+  "phase": null,
+  "error": null,
+  "email_count": 0,
+  "event_count": 0,
+  "review_count": 0,
+  "stats": null
+}
+```
+
+**创建即校验**：目标不存在或已删除返回 `404 target_not_found`；目标未
+完成返回 `409 target_not_completed`；请求体非 JSON / 缺字段 / ID 格式
+非法 / 未知字段返回 `400 bad_request`。
+
+### 事件类型
+
+| type | 含义 |
+|---|---|
+| `added` | 相对父邮件参与者集合（From∪To∪Cc）新增的可见地址 |
+| `dropped` | 父邮件原 To/Cc 收件人未继续列入子邮件 To/Cc，且不是子邮件发件人（真正从收件人名单消失；父发件人“变成我回复”不计入） |
+| `role_changed` | 同一地址在父子邮件间 To/Cc 角色变化（To→Cc 或 Cc→To），证据带 `from_role`/`to_role` |
+| `reply_all_omitted` | 相对父邮件全部参与者（From∪To∪Cc），子邮件可见集合缺失的地址（疑似未全部回复） |
+
+### 待复核（差异只列待复核，不生成客观事件）
+
+以下背景下的父子边差异**不升为 `events`**，而以 `reviews` 形式给出
+（仍附完整集合差异快照供人工判断）：
+
+* `possible_mailing_list` — 邮件列表/群组迹象：多地址 From（含 RFC
+  群组语法 `组名: a@x, b@y;`）、与 From 不同域的 Sender/Reply-To、
+  Sender/Reply-To 重复头，或可见地址为高置信列表形态
+  （`*-owners`、`*-request`、`*-subscribe`、`list-*`、
+  `bounces@`、`majordomo@` 等）；
+* `malformed_address` — From/To/Cc 中存在无法可靠归一化的畸形地址
+  （无 `@`、多个 `@`、含空白、域名标签非法、引号 local-part 等），
+  该地址不参与自动比较；
+* `missing_parent` — 声称回复但父邮件不在目标范围内，或挂载到
+  References 上溯祖先（直接父缺失）；
+* `reference_conflict` — 引用边被断开（成环/自引用），或被引用的
+  Message-ID 对应多封内容不同的邮件，父节点不确定。
+
+## 22. 查询分析进度 / 分析列表
+
+```
+GET /api/v1/recipient-flows/{flow_id}
+GET /api/v1/recipient-flows
+```
+
+`status`：`queued` → `processing` → `completed` | `failed`
+
+`phase` 依次为：`loading_target`、`flattening_threads`、
+`analyzing_recipients`、`writing_result`、`completed` / `failed`。
+`progress` 为 0–100 整数；`failed` 时 `error` 给出原因（例如目标在
+分析处理前被删除）。完成后 `stats` 结构：
+
+```json
+{
+  "emails": 9,
+  "unique_addresses": 12,
+  "malformed_addresses": 1,
+  "threads_total": 4,
+  "edges_total": 5,
+  "edges_compared": 2,
+  "edges_with_changes": 2,
+  "events_total": 11,
+  "events_by_type": {
+    "added": 3,
+    "dropped": 4,
+    "role_changed": 1,
+    "reply_all_omitted": 4
+  },
+  "reviews_total": 6,
+  "reviews_by_kind": {
+    "possible_mailing_list": 3,
+    "malformed_address": 2,
+    "missing_parent": 1,
+    "reference_conflict": 0
+  }
+}
+```
+
+## 23. 读取事件 / 待复核（按会话、地址、类型筛选）
+
+分析 `completed` 后可用，否则 `409 not_ready`。
+
+```
+GET /api/v1/recipient-flows/{flow_id}/events
+GET /api/v1/recipient-flows/{flow_id}/events?type=reply_all_omitted
+GET /api/v1/recipient-flows/{flow_id}/events?thread=0
+GET /api/v1/recipient-flows/{flow_id}/events?address=carl@example.org
+GET /api/v1/recipient-flows/{flow_id}/events?kind=possible_mailing_list
+```
+
+| 参数 | 说明 |
+|---|---|
+| `type` | 事件类型，须为 `added` / `dropped` / `role_changed` / `reply_all_omitted`，未知值返回 400；给出 `type` 时只返回事件、不返回待复核项 |
+| `kind` | 待复核类型，须为 `possible_mailing_list` / `malformed_address` / `missing_parent` / `reference_conflict`，未知值返回 400 |
+| `thread` | 会话根节点 uid（非负整数） |
+| `address` | 完整邮箱地址（`local-part@domain`）；与引擎同口径匹配（域名小写、local-part 原样），非法形态返回 400。事件按其**主地址**匹配（即该条差异针对的地址），待复核按差异清单/畸形地址/列表提示中的地址匹配 |
+
+参数可组合。响应顶层同时给出 `events`（客观事件）与 `reviews`
+（待复核项），各带 `event_count` / `review_count` 与回显的 `filters`。
+每条事件示例：
+
+```json
+{
+  "id": "E0007",
+  "type": "reply_all_omitted",
+  "thread_root_uid": 0,
+  "thread_root_message_id": "<rf-root@example.com>",
+  "email": {
+    "uid": 1,
+    "message_id": "<rf-reply-1@example.com>",
+    "subject": "Re: 合同付款安排",
+    "date": "2026-09-07T09:20:00+00:00",
+    "source": { "job_id": "...", "source_file": "02-reply-only-sender.eml" }
+  },
+  "parent_email": {
+    "uid": 0,
+    "message_id": "<rf-root@example.com>",
+    "date": "2026-09-07T09:00:00+00:00"
+  },
+  "time": "2026-09-07T09:20:00+00:00",
+  "address": "carl@example.org",
+  "fields": ["From", "To", "Cc"],
+  "summary": "地址 carl@example.org 相对父邮件参与者集合被遗漏（疑似未全部回复；仅据可见头，不含 Bcc/信封）",
+  "basis": "沿会话父子边比较 From/To/Cc 可见地址集合（忽略显示名，域名转小写、local-part 保持原样）；不使用 Bcc 或 SMTP 信封，不推断实际送达对象",
+  "evidence": {
+    "parent_participant_count": 4,
+    "child_participant_count": 2,
+    "sets": {
+      "parent": {
+        "from": ["legal@example.com"],
+        "to": ["bob@example.org", "carl@example.org"],
+        "cc": ["dana@example.org"]
+      },
+      "child": {
+        "from": ["bob@example.org"],
+        "to": ["legal@example.com"],
+        "cc": []
+      },
+      "differences": {
+        "added": [],
+        "dropped": ["carl@example.org", "dana@example.org"],
+        "role_changed": [],
+        "reply_all_omitted": ["carl@example.org", "dana@example.org"]
+      }
+    }
+  }
+}
+```
+
+约定：
+
+* 每条事件都附父子邮件（`email` / `parent_email`，含 uid、
+  Message-ID、时间、来源）、会话根（`thread_root_uid` /
+  `thread_root_message_id`）、涉及字段 `fields`、主地址 `address`、
+  判定依据 `basis` 与集合差异快照 `evidence.sets`（父子各自的
+  from/to/cc 与四类差异清单）；
+* `role_changed` 事件额外在 `evidence` 中给出 `from_role`、
+  `to_role`、`parent_fields`、`child_fields`；
+* `added` 的 `fields` 为该地址在子邮件中出现的字段，`dropped` 的
+  `fields` 为其在父邮件中出现的字段；
+* 案件分析的 `source` 为 `{case_id, sources:[...]}`（含全部来源作业）。
+
+待复核项（`reviews`）结构与事件同级，带 `kind`、`fields`、`email`、
+会话根与 `evidence`：邮件级背景（列表/畸形）挂在对应邮件上；
+父子边背景（`evidence.background_kinds`、`evidence.sets`）挂在子邮件上，
+其中集合差异快照与事件口径一致，便于人工复核。
+
+## 24. 按会话 / 地址台账查询
+
+### 24.1 按会话汇总
+
+```
+GET /api/v1/recipient-flows/{flow_id}/threads
+GET /api/v1/recipient-flows/{flow_id}/threads?address=carl@example.org
+GET /api/v1/recipient-flows/{flow_id}/threads?kind=missing_parent
+```
+
+每个会话（线程树）一项：`root_uid` / `root_message_id` /
+`email_count` / `node_uids` / `event_ids` / `review_ids` /
+`event_count` / `review_count`，并内联该会话命中的 `events` 与
+`reviews`（带 `matched_event_count` / `matched_review_count`）。
+支持 `address`、`kind`、`thread` 筛选；无命中的会话不返回。
+
+### 24.2 地址台账
+
+```
+GET /api/v1/recipient-flows/{flow_id}/addresses
+GET /api/v1/recipient-flows/{flow_id}/addresses?address=dana@X.COM
+```
+
+每个唯一（归一化）地址一项：`address`、该地址出现过的全部显示名
+`names`、出现字段 `fields`（From/To/Cc）、首次出现位置 `first_seen`
+与全部出现记录 `occurrences`（每次所在邮件与字段）。`address` 筛选
+按归一化键精确匹配（域名大小写不敏感、local-part 原样）。
+
+## 25. 下载分析结果 JSON
+
+```
+GET /api/v1/recipient-flows/{flow_id}/result
+```
+
+`200`，响应头：
+
+```
+Content-Type: application/json; charset=utf-8
+Content-Disposition: attachment; filename="<flow_id>.recipient-flow-result.json"
+```
+
+响应体为完整结果文件（顶层含 `recipient_flow_id`、`target_type`、
+`target_id`、`target`、`stats`、`events`、`reviews`、`threads`、
+`emails`、`addresses`；`emails` 为按邮件的汇总行，含可见地址计数、
+是否参与比较、`skip_reason` 与关联的事件/待复核 ID）。完成前请求返回
+`409 not_ready`。
+
+**结果独立落盘**（`DATA_DIR/recipient_flows/<flow_id>/result.json`）：
+分析完成后删除源作业/案件不影响结果的读取与下载；服务重启后，未完成
+的分析会自动重新入队处理。
+
 ## 错误响应格式
 
 所有错误统一为：
@@ -923,8 +1194,8 @@ Content-Disposition: attachment; filename="<check_id>.identity-result.json"
 
 | 状态码 | code | 触发场景 |
 |---|---|---|
-| 400 | `bad_request` | 请求体为空、multipart 缺 `file`、作业/案件/分析/核验 ID 格式非法、Idempotency-Key 格式非法、案件/分析/核验请求体非合法 JSON、案件作业数超限、分析阈值非法、时间线/核验筛选参数非法（未知 type/status、空 domain、邮件端点传会话级类型） |
-| 404 | `not_found` | 路径或作业/案件/分析/核验不存在 |
+| 400 | `bad_request` | 请求体为空、multipart 缺 `file`、作业/案件/分析/核验/追踪 ID 格式非法、Idempotency-Key 格式非法、案件/分析/核验/追踪请求体非合法 JSON、案件作业数超限、分析阈值非法、时间线/核验/收件人流转筛选参数非法（未知 type/status/kind、空 domain/address、非法 address/thread、邮件端点传会话级类型） |
+| 404 | `not_found` | 路径或作业/案件/分析/核验/追踪不存在 |
 | 404 | `job_not_found` | 创建案件时引用的源作业不存在或已删除 |
 | 404 | `target_not_found` | 创建分析/核验时引用的目标作业/案件不存在或已删除 |
 | 409 | `idempotency_conflict` | 同 Key 不同内容 |

@@ -12,11 +12,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from . import attachflow, config, identity, jsonio, timing
+from . import attachflow, config, identity, jsonio, recipientflow, timing
 from .attachproc import AttachmentFlowProcessor
 from .caseproc import CaseProcessor
 from .identityproc import IdentityProcessor
 from .processor import JobProcessor
+from .recflowproc import RecipientFlowProcessor
 from .storage import Storage
 from .timeproc import TimingProcessor
 
@@ -117,6 +118,7 @@ class Handler(BaseHTTPRequestHandler):
     timing_processor: TimingProcessor
     identity_processor: IdentityProcessor
     flow_processor: AttachmentFlowProcessor
+    recipient_flow_processor: RecipientFlowProcessor
     create_lock: threading.Lock
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -196,6 +198,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._list_identity_checks()
             elif path == "/api/v1/attachment-flows":
                 self._list_attachment_flows()
+            elif path == "/api/v1/recipient-flows":
+                self._list_recipient_flows()
             else:
                 match = re.fullmatch(r"/api/v1/jobs/([^/]+)", path)
                 if match:
@@ -291,6 +295,36 @@ class Handler(BaseHTTPRequestHandler):
                 if match:
                     self._get_flow_result(match.group(1))
                     return
+                match = re.fullmatch(
+                    r"/api/v1/recipient-flows/([^/]+)", path
+                )
+                if match:
+                    self._get_recipient_flow(match.group(1))
+                    return
+                match = re.fullmatch(
+                    r"/api/v1/recipient-flows/([^/]+)/events", path
+                )
+                if match:
+                    self._get_recipient_flow_events(match.group(1), query)
+                    return
+                match = re.fullmatch(
+                    r"/api/v1/recipient-flows/([^/]+)/threads", path
+                )
+                if match:
+                    self._get_recipient_flow_threads(match.group(1), query)
+                    return
+                match = re.fullmatch(
+                    r"/api/v1/recipient-flows/([^/]+)/addresses", path
+                )
+                if match:
+                    self._get_recipient_flow_addresses(match.group(1), query)
+                    return
+                match = re.fullmatch(
+                    r"/api/v1/recipient-flows/([^/]+)/result", path
+                )
+                if match:
+                    self._get_recipient_flow_result(match.group(1))
+                    return
                 self._error(404, "not_found", f"未知路径: {self.path}")
         except ApiError as exc:
             self._error(exc.status, exc.code, exc.message)
@@ -311,6 +345,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._create_identity_check()
             elif path == "/api/v1/attachment-flows":
                 self._create_attachment_flow()
+            elif path == "/api/v1/recipient-flows":
+                self._create_recipient_flow()
             else:
                 self._error(404, "not_found", f"未知路径: {self.path}")
         except ApiError as exc:
@@ -1432,6 +1468,356 @@ class Handler(BaseHTTPRequestHandler):
         download_name = f"{flow['id']}.flow-result.json"
         self._file_download(Path(flow["result_path"]), download_name)
 
+    # ------------------------------------------------- 收件人流转分析端点
+
+    def _public_recipient_flow(self, flow: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": flow["id"],
+            "status": flow["status"],
+            "created_at": flow["created_at"],
+            "updated_at": flow["updated_at"],
+            "target_type": flow["target_type"],
+            "target_id": flow["target_id"],
+            "progress": flow["progress"],
+            "phase": flow["phase"],
+            "error": flow["error"],
+            "email_count": flow["email_count"],
+            "event_count": flow["event_count"],
+            "review_count": flow["review_count"],
+            "stats": flow["stats"],
+        }
+
+    def _require_recipient_flow(self, flow_id: str) -> dict[str, Any]:
+        if not _UUID_RE.fullmatch(flow_id):
+            raise ApiError(400, "bad_request", "分析 ID 格式非法")
+        flow = self.storage.get_recipient_flow(flow_id)
+        if flow is None:
+            raise ApiError(404, "not_found", f"收件人流转分析不存在: {flow_id}")
+        return flow
+
+    def _list_recipient_flows(self) -> None:
+        flows = self.storage.list_recipient_flows()
+        self._json(
+            200,
+            {"recipient_flows": [self._public_recipient_flow(f) for f in flows]},
+        )
+
+    def _create_recipient_flow(self) -> None:
+        content_type = self.headers.get("Content-Type", "")
+        if content_type.lower().split(";")[0].strip() != "application/json":
+            raise ApiError(
+                415,
+                "unsupported_media_type",
+                "创建收件人流转分析请使用 application/json 请求体",
+            )
+        body = self._read_body_capped()
+        if not body:
+            raise ApiError(400, "bad_request", "请求体为空")
+        try:
+            payload = jsonio.loads(body)
+        except Exception:
+            raise ApiError(400, "bad_request", "请求体不是合法 JSON")
+        if not isinstance(payload, dict):
+            raise ApiError(400, "bad_request", "请求体必须是 JSON 对象")
+
+        target_type = payload.get("target_type")
+        if target_type not in ("job", "case"):
+            raise ApiError(
+                400, "bad_request", "target_type 必须是 \"job\" 或 \"case\""
+            )
+        target_id = payload.get("target_id")
+        if not isinstance(target_id, str) or not _UUID_RE.fullmatch(target_id):
+            raise ApiError(400, "bad_request", "target_id 必须是作业/案件 UUID")
+        unknown = set(payload) - {"target_type", "target_id"}
+        if unknown:
+            raise ApiError(
+                400,
+                "bad_request",
+                "未知请求字段: " + ", ".join(sorted(unknown)),
+            )
+
+        with self.create_lock:
+            if target_type == "job":
+                target = self.storage.get_job(target_id)
+                label = "作业"
+            else:
+                target = self.storage.get_case(target_id)
+                label = "案件"
+            if target is None:
+                raise ApiError(
+                    404,
+                    "target_not_found",
+                    f"目标{label}不存在或已被删除: {target_id}",
+                )
+            if target["status"] != config.STATUS_COMPLETED:
+                raise ApiError(
+                    409,
+                    "target_not_completed",
+                    f"目标{label}未完成，不能创建收件人流转分析: {target_id} "
+                    f"(当前状态: {target['status']})",
+                )
+            flow_id = str(uuid.uuid4())
+            Storage.prepare_recipient_flow_dir(flow_id)
+            self.storage.create_recipient_flow(flow_id, target_type, target_id)
+
+        self.recipient_flow_processor.enqueue(flow_id)
+        flow = self.storage.get_recipient_flow(flow_id)
+        self._json(201, self._public_recipient_flow(flow))
+
+    def _get_recipient_flow(self, flow_id: str) -> None:
+        self._json(
+            200, self._public_recipient_flow(self._require_recipient_flow(flow_id))
+        )
+
+    def _completed_recipient_flow_result(
+        self, flow_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        flow = self._require_recipient_flow(flow_id)
+        if flow["status"] != config.STATUS_COMPLETED or not flow["result_path"]:
+            raise ApiError(
+                409,
+                "not_ready",
+                f"分析尚未完成 (当前状态: {flow['status']})",
+            )
+        result = jsonio.loads(Path(flow["result_path"]).read_text("utf-8"))
+        return flow, result
+
+    def _recipient_flow_filters(
+        self, query: dict[str, list[str]]
+    ) -> tuple[str | None, int | None, str | None, str | None]:
+        """解析 ?type=&thread=&address=&kind= 筛选参数，非法值明确拒绝。"""
+        raw_type = query.get("type", [None])[0]
+        if raw_type is not None and raw_type not in recipientflow.EVENT_TYPES:
+            raise ApiError(
+                400,
+                "bad_request",
+                f"未知事件类型: {raw_type!r}，可选: "
+                + ", ".join(recipientflow.EVENT_TYPES),
+            )
+        raw_thread = query.get("thread", [None])[0]
+        thread_uid = None
+        if raw_thread is not None:
+            if not raw_thread.isdigit():
+                raise ApiError(
+                    400,
+                    "bad_request",
+                    "thread 筛选参数须为非负整数（会话根节点 uid）",
+                )
+            thread_uid = int(raw_thread)
+        raw_address = query.get("address", [None])[0]
+        if "address" in query and (
+            raw_address is None or not raw_address.strip()
+        ):
+            raise ApiError(400, "bad_request", "address 筛选参数不能为空")
+        if raw_address is not None:
+            raw_address = raw_address.strip()
+            if _address_filter_key(raw_address) is None:
+                raise ApiError(
+                    400,
+                    "bad_request",
+                    "address 筛选参数须为 local-part@domain 形态的地址",
+                )
+        raw_kind = query.get("kind", [None])[0]
+        if raw_kind is not None and raw_kind not in recipientflow.REVIEW_KINDS:
+            raise ApiError(
+                400,
+                "bad_request",
+                f"未知待复核类型: {raw_kind!r}，可选: "
+                + ", ".join(recipientflow.REVIEW_KINDS),
+            )
+        return raw_type, thread_uid, raw_address, raw_kind
+
+    @staticmethod
+    def _event_mentions_address(event: dict[str, Any], address: str) -> bool:
+        """事件是否针对某地址：逐地址事件以其主地址为准。
+
+        匹配口径与引擎一致（忽略显示名、域名小写、local-part 原样）；
+        不按集合快照全集匹配，否则同一边上每个地址都会命中所有事件。
+        """
+        return event.get("address") == address
+
+    @staticmethod
+    def _review_mentions_address(review: dict[str, Any], address: str) -> bool:
+        evidence = review.get("evidence") or {}
+        # 畸形地址待复核：其原始地址归一化后等于筛选地址
+        if evidence.get("raw_address"):
+            if _address_filter_key(evidence["raw_address"]) == address:
+                return True
+        for cell in evidence.get("child_malformed", []) + evidence.get(
+            "parent_malformed", []
+        ):
+            if _address_filter_key(cell.get("raw_address", "")) == address:
+                return True
+        # 父子边背景待复核：地址须出现在差异清单（而非全集快照）中
+        differences = (evidence.get("sets") or {}).get("differences")
+        if differences is not None:
+            for key, addrs in differences.items():
+                if key == "role_changed":
+                    if any(
+                        isinstance(c, dict) and c.get("address") == address
+                        for c in addrs
+                    ):
+                        return True
+                elif address in addrs:
+                    return True
+        # 邮件级列表迹象：提示文本中精确出现该地址 token
+        if any(address in _address_tokens(hint) for hint in evidence.get("hints", []) or []):
+            return True
+        return False
+
+    def _get_recipient_flow_events(
+        self, flow_id: str, query: dict[str, list[str]]
+    ) -> None:
+        flow, result = self._completed_recipient_flow_result(flow_id)
+        ftype, thread_uid, address, kind = self._recipient_flow_filters(query)
+
+        def event_matches(event: dict[str, Any]) -> bool:
+            if ftype is not None and event["type"] != ftype:
+                return False
+            if thread_uid is not None and event["thread_root_uid"] != thread_uid:
+                return False
+            if address is not None and not self._event_mentions_address(
+                event, address
+            ):
+                return False
+            return True
+
+        events = [e for e in result["events"] if event_matches(e)]
+
+        # type 是事件专属维度：给出 type 时待复核项不参与（无事件类型）；
+        # kind 是待复核专属维度
+        reviews = [
+            r
+            for r in result["reviews"]
+            if (thread_uid is None or r["thread_root_uid"] == thread_uid)
+            and (kind is None or r["kind"] == kind)
+            and (address is None or self._review_mentions_address(r, address))
+        ]
+        if ftype is not None:
+            reviews = []
+
+        self._json(
+            200,
+            {
+                "recipient_flow_id": flow_id,
+                "target_type": flow["target_type"],
+                "target_id": flow["target_id"],
+                "filters": {
+                    "type": ftype,
+                    "thread": thread_uid,
+                    "address": address,
+                    "kind": kind,
+                },
+                "event_count": len(events),
+                "events": events,
+                "review_count": len(reviews),
+                "reviews": reviews,
+            },
+        )
+
+    def _get_recipient_flow_threads(
+        self, flow_id: str, query: dict[str, list[str]]
+    ) -> None:
+        flow, result = self._completed_recipient_flow_result(flow_id)
+        _, thread_uid, address, kind = self._recipient_flow_filters(query)
+        events_by_id = {e["id"]: e for e in result["events"]}
+        reviews_by_id = {r["id"]: r for r in result["reviews"]}
+
+        threads: list[dict[str, Any]] = []
+        for summary in result["threads"]:
+            if thread_uid is not None and summary["root_uid"] != thread_uid:
+                continue
+            events = [
+                events_by_id[eid]
+                for eid in summary["event_ids"]
+                if eid in events_by_id
+            ]
+            reviews = [
+                reviews_by_id[rid]
+                for rid in summary["review_ids"]
+                if rid in reviews_by_id
+            ]
+            if address is not None:
+                events = [
+                    e for e in events
+                    if self._event_mentions_address(e, address)
+                ]
+                reviews = [
+                    r for r in reviews
+                    if self._review_mentions_address(r, address)
+                ]
+            if kind is not None:
+                reviews = [r for r in reviews if r["kind"] == kind]
+            if address is not None or kind is not None:
+                if not events and not reviews:
+                    continue
+            threads.append(
+                {
+                    **summary,
+                    "matched_event_count": len(events),
+                    "matched_review_count": len(reviews),
+                    "events": events,
+                    "reviews": reviews,
+                }
+            )
+        self._json(
+            200,
+            {
+                "recipient_flow_id": flow_id,
+                "target_type": flow["target_type"],
+                "target_id": flow["target_id"],
+                "filters": {
+                    "thread": thread_uid,
+                    "address": address,
+                    "kind": kind,
+                },
+                "thread_count": len(threads),
+                "threads": threads,
+            },
+        )
+
+    def _get_recipient_flow_addresses(
+        self, flow_id: str, query: dict[str, list[str]]
+    ) -> None:
+        flow, result = self._completed_recipient_flow_result(flow_id)
+        raw_address = query.get("address", [None])[0]
+        if "address" in query and (
+            raw_address is None or not raw_address.strip()
+        ):
+            raise ApiError(400, "bad_request", "address 筛选参数不能为空")
+        address_key = None
+        if raw_address is not None:
+            address_key = _address_filter_key(raw_address.strip())
+            if address_key is None:
+                raise ApiError(
+                    400,
+                    "bad_request",
+                    "address 筛选参数须为 local-part@domain 形态的地址",
+                )
+        entries = result["addresses"]
+        if address_key is not None:
+            # 与事件口径一致：忽略显示名、域名转小写、local-part 保持原样
+            entries = [
+                e for e in entries
+                if _address_filter_key(e["address"]) == address_key
+            ]
+        self._json(
+            200,
+            {
+                "recipient_flow_id": flow_id,
+                "target_type": flow["target_type"],
+                "target_id": flow["target_id"],
+                "filters": {"address": raw_address},
+                "address_count": len(entries),
+                "addresses": entries,
+            },
+        )
+
+    def _get_recipient_flow_result(self, flow_id: str) -> None:
+        flow, _ = self._completed_recipient_flow_result(flow_id)
+        download_name = f"{flow['id']}.recipient-flow-result.json"
+        self._file_download(Path(flow["result_path"]), download_name)
+
 
 def _compact_forest(
     roots: list[dict[str, Any]],
@@ -1536,6 +1922,37 @@ def _parse_thresholds(raw: Any) -> dict[str, int]:
     return thresholds
 
 
+def _address_filter_key(raw: str) -> str | None:
+    """筛选地址归一化：与收件人引擎同口径（域名小写、local-part 原样）。
+
+    形态无法可靠归一化时返回 None（调用方按 400 处理）。
+    """
+    if not raw or raw.count("@") != 1 or any(ch.isspace() for ch in raw):
+        return None
+    local, domain = raw.split("@")
+    if not local or not domain or local.startswith('"'):
+        return None
+    if any(
+        not label or len(label) > 63
+        or label.startswith("-") or label.endswith("-")
+        for label in domain.split(".")
+    ):
+        return None
+    return f"{local}@{domain.lower()}"
+
+
+_ADDR_TOKEN_RE = re.compile(r"[^\s,;()]+@[^\s,;()]+")
+
+
+def _address_tokens(text: str) -> set[str]:
+    """从提示文本中提取地址 token 并归一化（仅用于待复核证据匹配）。"""
+    return {
+        key
+        for token in _ADDR_TOKEN_RE.findall(text)
+        if (key := _address_filter_key(token.strip("<>:"))) is not None
+    }
+
+
 def _parse_time_filter(
     raw_values: list[str] | None, name: str
 ) -> datetime | None:
@@ -1575,6 +1992,7 @@ class ApiServer(ThreadingHTTPServer):
         self.timing_processor = TimingProcessor(self.storage)
         self.identity_processor = IdentityProcessor(self.storage)
         self.flow_processor = AttachmentFlowProcessor(self.storage)
+        self.recipient_flow_processor = RecipientFlowProcessor(self.storage)
         self.create_lock = threading.Lock()
         # 注入给 Handler 实例使用
         Handler.storage = self.storage
@@ -1583,6 +2001,7 @@ class ApiServer(ThreadingHTTPServer):
         Handler.timing_processor = self.timing_processor
         Handler.identity_processor = self.identity_processor
         Handler.flow_processor = self.flow_processor
+        Handler.recipient_flow_processor = self.recipient_flow_processor
         Handler.create_lock = self.create_lock
 
     def start(self) -> None:
@@ -1592,6 +2011,7 @@ class ApiServer(ThreadingHTTPServer):
         self.timing_processor.start()
         self.identity_processor.start()
         self.flow_processor.start()
+        self.recipient_flow_processor.start()
 
     def serve(self) -> None:
         self.processor.start()
@@ -1599,6 +2019,7 @@ class ApiServer(ThreadingHTTPServer):
         self.timing_processor.start()
         self.identity_processor.start()
         self.flow_processor.start()
+        self.recipient_flow_processor.start()
         try:
             self.serve_forever()
         finally:

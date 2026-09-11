@@ -17,6 +17,13 @@ Message-ID 与 DKIM-Signature（保留重复头与原始值，提取地址、域
 Message-ID 域漂移、DKIM 的 `h` 未覆盖 From。**不查 DNS、不验证签名
 真伪**；转发、邮件列表与字段缺失只记为待复核证据，证据不足标无法核验，
 绝不判定伪造；每项发现都附来源文件、头字段与依据。
+收件人流转分析模块沿会话父子回复边逐条比较 **From/To/Cc 可见地址集合**
+（忽略显示名，域名转小写、local-part 保持原样），可对已完成作业或案件
+创建后台分析：记录新增地址、未继续列入收件人、To/Cc 角色变化，以及相对
+父邮件参与者的 reply-all 遗漏；每条事件附父子邮件、会话根、涉及字段、
+地址与集合差异。邮件列表/群组迹象、畸形地址、父链缺失、引用冲突时差异
+只列为待复核；**绝不根据 Bcc 或 SMTP 信封猜测实际送达对象，不改写现有
+会话树**。
 
 * 仅使用 Python 标准库：`http.server`、`email`、`zipfile`、`sqlite3`；
 * 不修改、不回传任何原始邮件，附件只导出元数据（名称/类型/大小/SHA-256）；
@@ -36,12 +43,14 @@ mailrecon/            服务源码
   casemerge.py        案件级多包合并（去重/冲突/补链，迭代式）
   timing.py           传输时序核验引擎（五类结论，记录所用字段与阈值）
   identity.py         声明身份核验引擎（四类发现 + 待复核证据/无法核验）
+  recipientflow.py    收件人流转引擎（四类事件 + 列表/畸形/父链/引用待复核）
   jsonio.py           迭代式 JSON 解析/序列化（深引用链不受递归深度限制）
-  storage.py          SQLite 元数据 + 作业/案件/分析/核验落盘文件管理
+  storage.py          SQLite 元数据 + 作业/案件/分析/核验/流转落盘文件管理
   processor.py        后台作业流水线（单线程顺序处理）
   caseproc.py         后台案件合并流水线（单线程顺序处理）
   timeproc.py         后台时序核验流水线（单线程顺序处理，重启续跑）
   identityproc.py     后台声明身份核验流水线（单线程顺序处理，重启续跑）
+  recflowproc.py      后台收件人流转流水线（单线程顺序处理，重启续跑）
   server.py           HTTP API（http.server）
   __main__.py         启动入口
 scripts/
@@ -49,9 +58,10 @@ scripts/
   make_case_sample.py 生成案件合并示例包 examples/case-pack-{1,2}.zip
   make_timing_sample.py 生成时序核验示例包 examples/timing-*.zip
   make_identity_sample.py 生成身份核验示例包 examples/identity-*.zip
+  make_recipient_sample.py 生成收件人流转示例包 examples/recipient-*.zip
   make_evil.py        生成应被拒绝的恶意/超限 ZIP
-tests/                191 个 unittest 用例
-examples/             生成产物（正常包 + 案件/时序示例包 + evil/ 恶意包）
+tests/                245 个 unittest 用例
+examples/             生成产物（正常包 + 案件/时序/身份/收件人示例包 + evil/ 恶意包）
 docs/API.md           接口文档
 docs/API_EXAMPLES.sh  curl 调用示例
 ```
@@ -222,6 +232,58 @@ curl '.../identity-checks/<check_id>/findings?domain=mailer.net'
 curl -OJ '.../identity-checks/<check_id>/result'
 ```
 
+## 收件人流转分析
+
+`POST /api/v1/recipient-flows` 对已完成的作业或案件创建后台收件人流转
+分析（接口详见 `docs/API.md` 第 21–25 节）。分析沿会话树的每一条父子
+回复边，逐条比较两封邮件的 **From / To / Cc 可见地址集合**：
+
+* **匹配口径**：忽略显示名；只把**域名转小写**，**local-part 保持原样**
+  （`a@X.com` = `a@x.com`，而 `John@x.com` ≠ `john@x.com`，不猜测
+  local-part 大小写语义）；
+* `added` — 相对父邮件参与者集合新增的可见地址；
+* `dropped` — 父邮件原 To/Cc 收件人未继续列入子邮件 To/Cc，且不是
+  子邮件发件人（父发件人在回复中“变成我”不算遗漏）；
+* `role_changed` — 同一地址 To↔Cc 角色变化（证据带 from/to_role）；
+* `reply_all_omitted` — 相对父邮件全部参与者（From∪To∪Cc），子邮件
+  可见集合遗漏的地址（疑似未全部回复）。
+
+**只看可见头，绝不推断实际送达**：不读取或推断 Bcc，不使用
+Return-Path/Sender/Received 等 SMTP 信封信息猜测谁真正收到，不查 DNS；
+分析只读结果 JSON，**绝不改写现有会话树**。
+
+下列背景下的父子边差异**只列为待复核（`reviews`），不生成客观事件**，
+但仍附完整集合差异快照供人工判断：
+
+* 邮件列表/群组迹象（多地址 From、RFC 群组语法、与 From 不同域的
+  Sender/Reply-To、列表形态地址如 `*-owners`/`*-request`/`list-*`）；
+* 畸形地址（无法可靠归一化的 From/To/Cc 地址，该地址不参与自动比较）；
+* 父链缺失（父邮件不在范围内或挂载到上溯祖先）；
+* 引用冲突（引用边断开、Message-ID 对应多封内容不同的邮件）。
+
+每条事件都附父子邮件（uid/Message-ID/时间/来源）、会话根、涉及字段
+`fields`、主地址、判定依据 `basis` 与集合差异快照（父子各自 from/to/cc
+及四类差异清单）。支持进度查询，按会话（`thread`）、地址（`address`）、
+事件类型（`type`）/待复核类型（`kind`）筛选，提供按会话汇总、地址台账
+与完整 JSON 下载。结果独立落盘，删除源作业/案件后仍可读，服务重启
+自动续跑未完成的分析。
+
+```bash
+python3 scripts/make_recipient_sample.py   # 生成收件人流转示例包
+# 上传 examples/recipient-mails.zip 为作业后：
+curl -X POST http://127.0.0.1:8080/api/v1/recipient-flows \
+     -H 'Content-Type: application/json' \
+     -d '{"target_type": "job", "target_id": "<job_id>"}'
+# 按地址 / 事件类型 / 待复核类型筛选
+curl '.../recipient-flows/<flow_id>/events?address=carl@example.org'
+curl '.../recipient-flows/<flow_id>/events?type=reply_all_omitted'
+curl '.../recipient-flows/<flow_id>/events?kind=possible_mailing_list'
+# 按会话汇总 / 地址台账 / 下载
+curl '.../recipient-flows/<flow_id>/threads'
+curl '.../recipient-flows/<flow_id>/addresses'
+curl -OJ '.../recipient-flows/<flow_id>/result'
+```
+
 ## 作业落盘与删除
 
 ```
@@ -232,16 +294,17 @@ DATA_DIR/jobs/<job_id>/extract/     处理期间临时解压目录，完成后�
 DATA_DIR/cases/<case_id>/result.json 案件合并结果（与源作业目录独立）
 DATA_DIR/analyses/<analysis_id>/result.json 时序核验结果（与源目标目录独立）
 DATA_DIR/identity_checks/<check_id>/result.json 身份核验结果（与源目标目录独立）
+DATA_DIR/recipient_flows/<flow_id>/result.json 收件人流转结果（与源目标目录独立）
 ```
 
 `DELETE /api/v1/jobs/{id}` 会删除元数据并 `rmtree` 整个作业目录；
-服务重启后，上次未完成的作业、案件、时序核验分析与声明身份核验会自动
-重新入队处理。
+服务重启后，上次未完成的作业、案件、时序核验分析、声明身份核验与
+收件人流转分析会自动重新入队处理。
 
 ## 测试
 
 ```bash
-python3 -m unittest discover -s tests -v     # 191 个用例
+python3 -m unittest discover -s tests -v     # 245 个用例
 ```
 
 ## 更多
