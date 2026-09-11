@@ -389,7 +389,9 @@ def _extract_attachments(
                 f"附件 {filename!r} 解析缺陷: {type(defect).__name__}"
             )
 
-        # 同名附件去重命名，仅为元数据展示用
+        # 同名附件去重命名，仅为元数据展示用；原始文件名保留在
+        # original_filename 中，供附件流转追踪按真实文件名匹配
+        # （否则展示层的 "(1)" 后缀或 MIME 顺序变化会被误判为改名）
         unique_name = filename
         if filename in used_names:
             used_names[filename] += 1
@@ -406,6 +408,8 @@ def _extract_attachments(
             "size": len(payload),
             "sha256": hashlib.sha256(payload).hexdigest(),
         }
+        if unique_name != filename:
+            attachment["original_filename"] = filename
         if undecodable:
             attachment["undecodable"] = True
         attachments.append(attachment)

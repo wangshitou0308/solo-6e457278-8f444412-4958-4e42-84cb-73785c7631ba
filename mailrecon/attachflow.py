@@ -11,6 +11,8 @@
 多重集合语义：**同一邮件中的重名/重复附件分别计数**——先按
 ``(文件名, SHA-256)`` 精确抵消，再按 SHA-256 配对改名、按文件名配对
 内容变化，剩余实例才计为新增/移除；每个事件带 ``count`` 实例数。
+文件名一律用解析期保留的**原始文件名**（``original_filename``），
+展示层去重后缀（如 ``report(1).pdf``）与 MIME 顺序变化不影响匹配。
 
 按 SHA-256 归并内容相同的附件，输出内容台账（``attachments``）：每个
 唯一内容记录首次出现位置（``first_seen``）与全部来源（``occurrences``，
@@ -53,8 +55,9 @@ def analyze(emails: list[dict[str, Any]]) -> dict[str, Any]:
     ``emails`` 每项需含：``uid``、``message_id``、``subject``、``from``、
     ``date``、``raw_sha256``、``in_reply_to``、``references``、
     ``attachments``（``filename``/``size``/``sha256``，可带
-    ``undecodable`` 标记）、``issues``、``parent_uid``、
-    ``thread_root_uid``、``thread_root_message_id``、``source``。
+    ``original_filename`` 与 ``undecodable`` 标记）、``issues``、
+    ``parent_uid``、``thread_root_uid``、``thread_root_message_id``、
+    ``source``。
 
     返回 ``{"events": [...], "reviews": [...], "attachments": [...],
     "emails": [...], "stats": {...}}``。
@@ -103,17 +106,18 @@ def analyze(emails: list[dict[str, Any]]) -> dict[str, Any]:
 
         # ---- 内容台账：全部可验证实例按 SHA-256 归并 -------------------
         for index, att in enumerate(verifiable):
+            name = _match_name(att)
             entry = registry.setdefault(
                 att["sha256"],
                 {"sha256": att["sha256"], "size": att["size"],
                  "names": [], "occurrences": []},
             )
-            if att["filename"] not in entry["names"]:
-                entry["names"].append(att["filename"])
+            if name not in entry["names"]:
+                entry["names"].append(name)
             entry["occurrences"].append(
                 {
                     "email": _mail_ref(mail),
-                    "filename": att["filename"],
+                    "filename": name,
                     "attachment_index": index,
                 }
             )
@@ -227,6 +231,17 @@ def analyze(emails: list[dict[str, Any]]) -> dict[str, Any]:
 
 # ================================================================ 附件拆分
 
+def _match_name(att: dict[str, Any]) -> str:
+    """用于多重集合匹配的文件名。
+
+    解析期对同邮件内的重名附件会生成展示层去重名（如 ``report(1).pdf``），
+    并把真实文件名记入 ``original_filename``；匹配一律用真实文件名，
+    否则展示层后缀或 MIME 顺序变化会被误判为改名。旧版结果文件没有
+    ``original_filename`` 字段时回退为展示名。
+    """
+    return att.get("original_filename") or att["filename"]
+
+
 def _split_attachments(
     mail: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
@@ -282,10 +297,10 @@ def _direct_ref(mail: dict[str, Any]) -> str | None:
 def _remaining_of(
     items: list[dict[str, Any]],
 ) -> dict[tuple[str, str], list[Any]]:
-    """(文件名, SHA-256) -> [剩余实例数, size]。"""
+    """(匹配文件名, SHA-256) -> [剩余实例数, size]。"""
     remaining: dict[tuple[str, str], list[Any]] = {}
     for item in items:
-        key = (item["filename"], item["sha256"])
+        key = (_match_name(item), item["sha256"])
         cell = remaining.setdefault(key, [0, item["size"]])
         cell[0] += 1
     return remaining
@@ -318,11 +333,18 @@ def _diff_edge(
     parent: dict[str, Any],
     parent_items: list[dict[str, Any]],
     child_items: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """比较一条父子边的附件多重集合，产出流转事件（确定性配对顺序）。
+    parent_has_undecodable: bool = False,
+    child_has_undecodable: bool = False,
+) -> list[tuple[dict[str, Any] | None, dict[str, Any] | None]]:
+    """比较一条父子边的附件多重集合（确定性配对顺序）。
 
     配对顺序：``(文件名, SHA-256)`` 精确抵消 -> 同 SHA-256 不同名配对为
     改名 -> 同名不同 SHA-256 配对为内容变化 -> 剩余为移除/新增。
+
+    返回 ``[(事件, None) | (None, 抑制说明)]`` 的列表：一侧存在无法解码
+    附件时，对侧剩余实例的新增/移除**不生成事件**（该实例可能就是无法
+    解码附件的真实内容），改以抑制说明返回，由调用方记入邮件行的
+    ``suppressed`` 待人工复核。
     """
     p_rem = _remaining_of(parent_items)
     c_rem = _remaining_of(child_items)
@@ -341,7 +363,7 @@ def _diff_edge(
         "matched_unchanged": matched_unchanged,
     }
 
-    events: list[dict[str, Any]] = []
+    out: list[tuple[dict[str, Any] | None, dict[str, Any] | None]] = []
 
     # 2. 改名：SHA-256 相同、文件名不同的剩余实例贪心两两配对
     p_by_sha = _group_remaining(p_rem, "sha256")
@@ -351,10 +373,13 @@ def _diff_edge(
                                                  c_by_sha[sha]):
             p_rem[(p_cell[0], sha)][0] -= count
             c_rem[(c_cell[0], sha)][0] -= count
-            events.append(
-                _event(mail, parent, "renamed", evidence_base,
-                       filename=c_cell[0], previous_filename=p_cell[0],
-                       sha256=sha, size=c_cell[1], count=count)
+            out.append(
+                (
+                    _event(mail, parent, "renamed", evidence_base,
+                           filename=c_cell[0], previous_filename=p_cell[0],
+                           sha256=sha, size=c_cell[1], count=count),
+                    None,
+                )
             )
 
     # 3. 内容变化：文件名相同、SHA-256 不同的剩余实例贪心两两配对
@@ -365,27 +390,66 @@ def _diff_edge(
                                                  c_by_name[name]):
             p_rem[(name, p_cell[0])][0] -= count
             c_rem[(name, c_cell[0])][0] -= count
-            events.append(
-                _event(mail, parent, "content_changed", evidence_base,
-                       filename=name, sha256=c_cell[0],
-                       previous_sha256=p_cell[0], size=c_cell[1],
-                       previous_size=p_cell[1], count=count)
+            out.append(
+                (
+                    _event(mail, parent, "content_changed", evidence_base,
+                           filename=name, sha256=c_cell[0],
+                           previous_sha256=p_cell[0], size=c_cell[1],
+                           previous_size=p_cell[1], count=count),
+                    None,
+                )
             )
 
-    # 4. 剩余：父邮件侧为移除，子邮件侧为新增
+    # 4. 剩余：父邮件侧为移除，子邮件侧为新增；对侧有无法解码附件时抑制
     for (name, sha), (count, size) in sorted(p_rem.items()):
-        if count > 0:
-            events.append(
-                _event(mail, parent, "removed", evidence_base,
-                       filename=name, sha256=sha, size=size, count=count)
+        if count <= 0:
+            continue
+        if child_has_undecodable:
+            out.append(
+                (None, _suppressed_note("removed", name, sha, size, count))
+            )
+        else:
+            out.append(
+                (
+                    _event(mail, parent, "removed", evidence_base,
+                           filename=name, sha256=sha, size=size, count=count),
+                    None,
+                )
             )
     for (name, sha), (count, size) in sorted(c_rem.items()):
-        if count > 0:
-            events.append(
-                _event(mail, parent, "added", evidence_base,
-                       filename=name, sha256=sha, size=size, count=count)
+        if count <= 0:
+            continue
+        if parent_has_undecodable:
+            out.append(
+                (None, _suppressed_note("added", name, sha, size, count))
             )
-    return events
+        else:
+            out.append(
+                (
+                    _event(mail, parent, "added", evidence_base,
+                           filename=name, sha256=sha, size=size, count=count),
+                    None,
+                )
+            )
+    return out
+
+
+def _suppressed_note(
+    note_type: str, filename: str, sha256: str, size: int, count: int
+) -> dict[str, Any]:
+    """被抑制的剩余实例说明（记入邮件行的 ``suppressed``）。"""
+    side = "子邮件" if note_type == "removed" else "父邮件"
+    return {
+        "type": note_type,
+        "filename": filename,
+        "sha256": sha256,
+        "size": size,
+        "count": count,
+        "reason": (
+            f"{side}存在无法解码的附件，该实例可能就是其真实内容，"
+            f"未生成{_EVENT_LABELS[note_type]}事件，待人工复核"
+        ),
+    }
 
 
 def _pair_cells(
@@ -498,13 +562,13 @@ def _undecodable_review(
         if legacy
         else "解析期标记为内容无法解码（记录的 SHA-256/大小为占位值）"
     )
+    name = _match_name(att)
     return _review(
         mail,
         "undecodable_attachment",
-        f"附件 {att['filename']!r} 内容无法解码，不参与流转推断，"
-        "仅列为待复核",
+        f"附件 {name!r} 内容无法解码，不参与流转推断，仅列为待复核",
         {
-            "filename": att["filename"],
+            "filename": name,
             "size": att["size"],
             "sha256": att["sha256"],
             "note": note,
@@ -546,8 +610,17 @@ def _edge_conflict_review(
 
 
 def _conflict_review(
-    mail: dict[str, Any], group: list[dict[str, Any]], own_dup: bool
+    mail: dict[str, Any],
+    conflicted_mid: str,
+    group: list[dict[str, Any]],
+    own_dup: bool,
 ) -> dict[str, Any]:
+    """Message-ID 冲突待复核项。
+
+    ``conflicted_mid`` 为冲突的 Message-ID（``own_dup=True`` 时是本邮件
+    自身的 ID，否则是本邮件声称回复的父邮件 ID）；``group`` 为共享该
+    ID 的全部邮件。
+    """
     variants = [
         {
             "uid": m["uid"],
@@ -556,24 +629,24 @@ def _conflict_review(
         }
         for m in sorted(group, key=lambda m: m["uid"])
     ]
-    mid = mail.get("message_id")
     if own_dup:
         summary = (
-            f"邮件的 Message-ID {mid} 被 {len(group)} 封内容不同的邮件"
-            "复用，本邮件不是规范节点，会话位置无法确定，"
+            f"邮件的 Message-ID {conflicted_mid} 被 {len(group)} 封内容"
+            "不同的邮件复用，本邮件不是规范节点，会话位置无法确定，"
             "不做附件流转推断，仅列为待复核"
         )
     else:
         summary = (
-            f"邮件声称回复的 Message-ID {mid} 对应 {len(group)} 封内容"
-            "不同的邮件，父节点不确定，不做附件流转推断，仅列为待复核"
+            f"邮件声称回复的 Message-ID {conflicted_mid} 对应 "
+            f"{len(group)} 封内容不同的邮件，父节点不确定，"
+            "不做附件流转推断，仅列为待复核"
         )
     return _review(
         mail,
         "reference_conflict",
         summary,
         {
-            "message_id": mid,
+            "message_id": conflicted_mid,
             "variant_count": len(variants),
             "variants": variants,
         },
