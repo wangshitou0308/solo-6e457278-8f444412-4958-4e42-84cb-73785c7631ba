@@ -46,7 +46,7 @@ def _empty_identity() -> dict[str, Any]:
 _CONTENT_FIELDS = (
     "message_id", "raw_sha256", "in_reply_to", "references", "date",
     "from", "to", "cc", "subject", "body_text", "body_html_present",
-    "attachments", "received", "identity",
+    "quote_structure", "attachments", "received", "identity",
 )
 
 

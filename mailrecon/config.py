@@ -19,6 +19,21 @@ def _int_env(name: str, default: int) -> int:
     return value
 
 
+def _float_env(name: str, default: float, *, maximum: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"环境变量 {name} 必须是数字，实际为: {raw!r}") from None
+    if not 0 < value <= maximum:
+        raise ValueError(
+            f"环境变量 {name} 必须在 (0, {maximum}] 区间内，实际为: {value}"
+        )
+    return value
+
+
 def _data_dir() -> Path:
     raw = os.environ.get("MAILRECON_DATA_DIR")
     path = Path(raw) if raw else Path(__file__).resolve().parent.parent / "data"
@@ -66,6 +81,17 @@ DEFAULT_MAX_TRANSIT_SECONDS = _int_env(
 # 用户可配置阈值的上限（秒），防止误填超大值导致核验失效
 MAX_THRESHOLD_SECONDS = _int_env(
     "MAILRECON_MAX_THRESHOLD_SECONDS", 7 * 24 * 3600
+)
+
+# 引文溯源：疑似改写的相似度下限（0, 1]，低于该值只列“相似度不足”待复核
+QUOTE_PARAPHRASE_MIN = _float_env(
+    "MAILRECON_QUOTE_PARAPHRASE_MIN", 0.6, maximum=1.0
+)
+# 引文溯源：每段引文保留的候选来源邮件数上限（并列候选，不自动归属）
+QUOTE_MAX_CANDIDATES = _int_env("MAILRECON_QUOTE_MAX_CANDIDATES", 20)
+# 引文溯源：参与疑似改写判定的文本长度上限（超出只做精确/截取匹配）
+QUOTE_PARAPHRASE_MAX_CHARS = _int_env(
+    "MAILRECON_QUOTE_PARAPHRASE_MAX_CHARS", 20000
 )
 
 # 作业状态

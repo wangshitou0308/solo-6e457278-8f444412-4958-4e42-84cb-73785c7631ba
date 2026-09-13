@@ -73,6 +73,7 @@ def build_threads(records: list[dict[str, Any]]) -> dict[str, Any]:
             "subject": rec["subject"],
             "body_text": rec["body_text"],
             "body_html_present": rec.get("body_html_present", False),
+            "quote_structure": rec.get("quote_structure"),
             "attachments": rec["attachments"],
             "received": rec.get("received", []),
             "identity": rec.get("identity") or _empty_identity(),

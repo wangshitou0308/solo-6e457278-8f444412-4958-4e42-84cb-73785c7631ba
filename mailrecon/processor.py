@@ -13,7 +13,8 @@ from .storage import Storage, utc_now
 _PUBLIC_FIELDS = (
     "uid", "source_file", "raw_sha256", "message_id", "in_reply_to",
     "references", "date", "from", "to", "cc", "subject", "body_text",
-    "body_html_present", "attachments", "received", "identity", "issues",
+    "body_html_present", "quote_structure", "attachments", "received",
+    "identity", "issues",
 )
 
 

@@ -16,6 +16,8 @@ from email.utils import getaddresses, parsedate_to_datetime
 from typing import Any
 
 from .idheaders import parse_identity_headers
+from .quoteparse import html_to_text as _html_to_text
+from . import quoteparse
 from .received import parse_received_headers
 
 # 从裸文本里提取 <msg-id@host> 形态标识
@@ -53,6 +55,7 @@ def parse_eml(raw: bytes, source_name: str) -> dict[str, Any]:
             "subject": None,
             "body_text": "",
             "body_html_present": False,
+            "quote_structure": quoteparse.empty_structure(),
             "attachments": [],
             "received": [],
             "identity": identity,
@@ -83,7 +86,7 @@ def parse_eml(raw: bytes, source_name: str) -> dict[str, Any]:
     except Exception as exc:  # 畸形编码头
         issues.append(f"Subject 头无法解码: {type(exc).__name__}: {exc}")
 
-    body_text, html_present, body_issues = _extract_body(msg)
+    body_text, html_present, quote_structure, body_issues = _extract_body(msg)
     issues.extend(body_issues)
 
     attachments, att_issues = _extract_attachments(msg)
@@ -110,6 +113,7 @@ def parse_eml(raw: bytes, source_name: str) -> dict[str, Any]:
         "subject": subject,
         "body_text": body_text,
         "body_html_present": html_present,
+        "quote_structure": quote_structure,
         "attachments": attachments,
         "received": received,
         "identity": identity,
@@ -260,7 +264,15 @@ def _decode_part_bytes(
     return None
 
 
-def _extract_body(msg: EmailMessage) -> tuple[str, bool, list[str]]:
+def _extract_body(
+    msg: EmailMessage,
+) -> tuple[str, bool, dict[str, Any], list[str]]:
+    """提取留档正文，并保留引文结构（> 层级/分隔线/<blockquote> 边界）。
+
+    返回 ``(body_text, body_html_present, quote_structure, issues)``；
+    纯文本正文的引文结构直接以 ``body_text`` 为字符区间基准，HTML 正文
+    以 quoteparse 的 html_view 为基准（见 quoteparse 模块文档）。
+    """
     issues: list[str] = []
     html_present = False
     chosen: EmailMessage | None = None
@@ -270,7 +282,7 @@ def _extract_body(msg: EmailMessage) -> tuple[str, bool, list[str]]:
         issues.append(f"遍历 MIME 正文失败: {type(exc).__name__}: {exc}")
 
     if chosen is None:
-        return "", False, issues
+        return "", False, quoteparse.empty_structure(), issues
 
     try:
         html_present = chosen.get_content_type() == "text/html"
@@ -283,33 +295,21 @@ def _extract_body(msg: EmailMessage) -> tuple[str, bool, list[str]]:
 
     text = _decode_part_bytes(chosen, issues, what)
     if text is None:
-        return "", html_present, issues
+        return "", html_present, quoteparse.empty_structure(), issues
     if html_present:
+        # 引文结构基于原始 HTML（保留 <blockquote> 边界），
+        # 留档正文仍做极简 HTML→文本转换（行为不变）
+        quote_structure = quoteparse.structure_from_html(text)
         text = _html_to_text(text)
-    return text.strip(), True if (html_present or text) else False, issues
-
-
-_TAG_RE = re.compile(r"(?is)<(script|style)[^>]*>.*?</\1>")
-_BR_RE = re.compile(
-    r"(?i)<\s*/?\s*(br|p|div|tr|h[1-6]|li|ul|ol|table|blockquote)[^>]*>"
-)
-_TAG_STRIP_RE = re.compile(r"(?s)<[^>]+>")
-_WS_RE = re.compile(r"[ \t\r\f\v]+")
-_BLANK_LINES_RE = re.compile(r"\n{3,}")
-
-
-def _html_to_text(html: str) -> str:
-    """极简 HTML 转文本（不引入第三方依赖），仅用于留档正文。"""
-    import html as html_mod
-
-    text = _TAG_RE.sub("", html)
-    text = _BR_RE.sub("\n", text)
-    text = _TAG_STRIP_RE.sub("", text)
-    text = html_mod.unescape(text)
-    lines = [_WS_RE.sub(" ", line).strip() for line in text.splitlines()]
-    text = "\n".join(line for line in lines if line is not None)
-    text = _BLANK_LINES_RE.sub("\n\n", text)
-    return text.strip()
+    else:
+        text = text.strip()
+        quote_structure = quoteparse.structure_from_text(text)
+    return (
+        text.strip(),
+        True if (html_present or text) else False,
+        quote_structure,
+        issues,
+    )
 
 
 # ---------------------------------------------------------------- 附件
